@@ -1,0 +1,99 @@
+# chunkeval v2 — local services.
+#
+#   weaviate : vector DB, bring-your-own vectors computed in Python
+#              (two named vectors per chunk: bge_m3 primary, qwen3_06b secondary). Always on.
+#   ollama   : OPTIONAL containerised alternative to the system-wide Ollama service.
+#              Off by default (Compose profile "ollama") — see README "Moving Ollama to Docker".
+#
+#   docker compose up -d                       # Weaviate only
+#   docker compose --profile ollama up -d      # Weaviate + Ollama container
+#   docker compose logs -f [service]           # watch start-up
+#   docker compose --profile ollama down       # stop everything (data kept in the named volumes)
+#   docker compose down -v                     # stop AND delete the Weaviate data (re-create with `chunkeval index`)
+#
+# Reads WEAVIATE_API_KEY (and optionally OLLAMA_HOST_PORT) from .env — Compose loads .env automatically.
+# Settings must match configs/default.yaml -> weaviate: {...} and ollama: {...}.
+
+# Fixed project name, so containers/volumes are named chunkeval-* regardless of the folder name.
+name: chunkeval
+
+services:
+  weaviate:
+    # Pinned on purpose: a silent server upgrade mid-experiment could change HNSW/BM25 behaviour.
+    # weaviate-client 4.22 requires server >= 1.27. Bump deliberately and re-run the smoke test.
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.8
+    container_name: chunkeval-weaviate
+    command: ["--host", "0.0.0.0", "--port", "8080", "--scheme", "http"]
+    ports:
+      # Bound to localhost only — not reachable from the network.
+      - "127.0.0.1:8080:8080"     # REST
+      - "127.0.0.1:50051:50051"   # gRPC — required by the v4 Python client (queries + batch import)
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    restart: "no"                 # dev box: start it when you need it; use "unless-stopped" to auto-start
+    environment:
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      CLUSTER_HOSTNAME: "node1"
+      QUERY_DEFAULTS_LIMIT: "25"
+
+      # No vectorizer modules: vectors are computed client-side (BAAI/bge-m3 + Qwen/Qwen3-Embedding-0.6B,
+      # see src/chunkeval/corpus/embedding.py), so the container needs no GPU and no model downloads.
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+
+      # API-key auth with RBAC (same model as the previous setup's AUTHORIZATION_RBAC_ROOT_USERS).
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+      AUTHENTICATION_APIKEY_ENABLED: "true"
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: "${WEAVIATE_API_KEY:?set WEAVIATE_API_KEY in .env}"
+      AUTHENTICATION_APIKEY_USERS: "chunkeval"
+      AUTHORIZATION_RBAC_ENABLED: "true"
+      AUTHORIZATION_RBAC_ROOT_USERS: "chunkeval"
+
+      # Soft memory cap for the Go runtime — 12 collections x 2 named vectors (1024-dim each) need a few GB at most.
+      GOMEMLIMIT: "6GiB"
+      DISABLE_TELEMETRY: "true"
+
+  ollama:
+    # OPTIONAL — only started with `--profile ollama`. Never run it while the system Ollama
+    # service has models loaded: two servers on one 16 GB GPU push each other's layers to the CPU.
+    profiles: ["ollama"]
+    # Pinned to the same version as the system install (0.30.4) so moving over changes nothing.
+    image: ollama/ollama:0.30.4
+    container_name: chunkeval-ollama
+    ports:
+      # Same port as the system service, so OLLAMA_BASE_URL in .env stays unchanged after the move.
+      # For a side-by-side test while the system service still runs, set OLLAMA_HOST_PORT=11435 in .env.
+      - "127.0.0.1:${OLLAMA_HOST_PORT:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: "no"
+    environment:
+      # The settings that used to live in `sudo systemctl edit ollama` (see llm.py / README).
+      OLLAMA_CONTEXT_LENGTH: "8192"      # = configs/default.yaml ollama.context_length
+      OLLAMA_NUM_PARALLEL: "2"           # = configs/default.yaml ollama.concurrency
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+      OLLAMA_KEEP_ALIVE: "5m"
+      OLLAMA_MAX_LOADED_MODELS: "1"      # one model on the GPU at a time (generator, then critic)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # Docker here already has the nvidia runtime + CDI devices (nvidia-container-toolkit 1.20.1).
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]    # succeeds only when the server answers
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  # Dedicated to this project — do not reuse other projects' volumes. Explicit names so the
+  # commands in the README work as written.
+  weaviate_data:
+    name: chunkeval_weaviate_data
+  ollama_models:
+    name: chunkeval_ollama_models

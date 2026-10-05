@@ -1,0 +1,16 @@
+# Secrets — never commit (the old ragas_evaluation.py leaked keys; rotate them)
+.env
+
+# Environments / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Pipeline artefacts (large, regenerable)
+data/
+runs/
+*.pkl
+.env
+# Added by ggshield
+.cache_ggshield

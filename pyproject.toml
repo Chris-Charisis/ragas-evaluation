@@ -1,0 +1,76 @@
+[project]
+name = "ragas-evaluation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.8.1",
+    "bitsandbytes>=0.50.0",
+    "datasets>=3.6.0",
+    "docling>=2.133.0",
+    "elasticsearch<9.0.0",
+    "ipykernel>=6.29.5",
+    "jsonschema>=4.26.0",
+    "langchain>=0.3.26",
+    "matplotlib>=3.11.2",
+    "openai>=1.95.0",
+    "pillow>=11.3.0",
+    "pip>=25.1.1",
+    "protobuf>=6.31.1",
+    "pydantic>=2.13.4",
+    "pysbd>=0.3.4",
+    "python-dotenv>=1.1.1",
+    "pyyaml>=6.0.2",
+    "ragas>=0.2.15",
+    "rapidfuzz>=3.14.6",
+    "rouge-score>=0.1.2",
+    "sacrebleu>=2.5.1",
+    "safetensors==0.4.3",
+    "sentence-transformers>=5.0.0",
+    "sentencepiece>=0.2.0",
+    "tqdm>=4.67.1",
+    "typer>=0.26.8",
+    "weaviate-client>=4.22.0",
+]
+
+# Makes the project installable: `uv sync` installs `chunkeval` in editable mode, so
+# `import chunkeval` works everywhere (CLI, tests, notebooks) without PYTHONPATH=src, and code
+# changes take effect without reinstalling.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chunkeval"]      # import name differs from the project name (ragas-evaluation)
+
+[project.scripts]
+chunkeval = "chunkeval.cli:main"  # `uv run chunkeval <command> --config configs/default.yaml`
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Live tests skip themselves when their service is unavailable. Fast offline run only:
+#   pytest -m "not ollama and not openai"
+markers = [
+    "ollama: talks to the local Ollama server and loads models into the GPU (slow)",
+    "openai: calls the OpenAI API (free metadata endpoints only, needs OPENAI_API_KEY)",
+    "gpu: loads embedding models onto the GPU",
+]
+
+# ---------------------------------------------------------------------------
+# chunkeval v2 — notes on dependencies
+# ---------------------------------------------------------------------------
+# Installed for v2: docling (parsing), pysbd (sentences), rapidfuzz (quote locator),
+# openai (LLM client), python-dotenv, pyyaml, pydantic (config), typer (optional CLI),
+# matplotlib (plots), rouge-score (text metrics), pytest (dev group).
+# Note: docling upgraded torch 2.7.1 -> 2.14.1 (+cu130), which supports the RTX 5070 Ti (sm_120).
+#
+# "ragas>=<latest>"   # TODO(you): still 0.2.15 — read the changelog/migration guide before upgrading
+#
+# Local LLMs: served by Ollama (system service, not a Python dependency) through the `openai`
+# client — see src/chunkeval/core/llm.py. No vllm/bitsandbytes needed for v2.

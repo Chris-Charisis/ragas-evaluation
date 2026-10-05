@@ -1,0 +1,188 @@
+"""cli.py — argument parsing, the stage table, and what `main` does around every stage.
+
+Offline: stage functions are replaced by fakes, Ollama calls by stubs.
+"""
+import inspect
+from pathlib import Path
+
+import pytest
+import yaml
+
+from chunkeval import cli
+from chunkeval.core.config import Secrets
+from chunkeval.core.schema import Config
+
+
+@pytest.fixture
+def config_file(tmp_path, raw_config) -> Path:
+    """The default config with runs_dir in a temp dir, as a file for `--config`."""
+    raw_config["paths"]["runs_dir"] = str(tmp_path / "runs")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw_config), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    """Replace every stage function with a fake that records its arguments."""
+    recorded: list[dict] = []
+
+    def fake_resolve(target):
+        def fake_run(cfg, secrets, **options):
+            recorded.append({"target": target, "cfg": cfg, "secrets": secrets, "options": options})
+        return fake_run
+    monkeypatch.setattr(cli, "resolve", fake_resolve)
+    return recorded
+
+
+@pytest.fixture
+def ollama(monkeypatch):
+    """Stub out the Ollama preflight and unload; record what was called."""
+    from chunkeval.core import llm
+    events: list[tuple] = []
+    monkeypatch.setattr(llm, "check_ollama", lambda cfg, url: events.append(("check", url)))
+    monkeypatch.setattr(llm, "unload_ollama_model", lambda url, model: events.append(("unload", model)))
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    return events
+
+
+# --------------------------------------------------------------------------------------
+# The stage table must match the stage code
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("command", cli.STAGES)
+def test_stage_targets_accept_the_cli_options(command, cfg):
+    """Every target imports, and its `run` accepts (cfg, secrets, **declared options).
+
+    Fails when an option is added to the CLI but not to the stage's `run` (or the reverse
+    for required parameters) — before anyone runs the stage for real.
+    """
+    stage = cli.STAGES[command]
+    options = {"corpora": ["papers"], "limit": 1}
+    for target in stage.targets:
+        function = cli.resolve(target)
+        inspect.signature(function).bind(cfg, Secrets(), **{o: options[o] for o in stage.options})
+
+
+def test_every_stage_option_is_registered():
+    assert {o for s in cli.STAGES.values() for o in s.options} <= set(cli.OPTIONS)
+
+
+def test_llm_stages_match_config_roles():
+    """Stages with LLM roles (config.STAGE_LLM_ROLES) must exist in the CLI."""
+    from chunkeval.core.config import STAGE_LLM_ROLES
+    assert set(STAGE_LLM_ROLES) <= set(cli.STAGES)
+
+
+# --------------------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------------------
+
+def test_options_only_where_declared():
+    args = cli.build_parser().parse_args(["parse", "--corpus", "papers", "--limit", "2", "-v"])
+    assert (args.corpora, args.limit, args.verbose) == (["papers"], 2, True)
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["embed", "--corpus", "papers"])     # embed has no --corpus
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "two"])
+def test_limit_must_be_positive_int(value):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["parse", "--limit", value])
+
+
+def test_default_corpora_are_all_configured(cfg):
+    args = cli.build_parser().parse_args(["parse"])
+    assert cli.stage_options(cli.STAGES["parse"], args, cfg) == {"corpora": list(cfg.paths.corpora), "limit": None}
+
+
+def test_repeated_corpus_deduplicated_in_order(cfg):
+    args = cli.build_parser().parse_args(["chunk", "--corpus", "reports", "--corpus", "papers", "--corpus", "reports"])
+    assert cli.stage_options(cli.STAGES["chunk"], args, cfg)["corpora"] == ["reports", "papers"]
+
+
+def test_unknown_corpus_rejected(cfg):
+    args = cli.build_parser().parse_args(["parse", "--corpus", "books"])
+    with pytest.raises(SystemExit, match="unknown corpus"):
+        cli.stage_options(cli.STAGES["parse"], args, cfg)
+
+
+def test_ollama_models_per_stage(cfg):
+    assert cli.ollama_models("parse", cfg) == []
+    assert cli.ollama_models("gen-qa", cfg) == [cfg.llm.qa_generator.model]
+    assert cli.ollama_models("eval", cfg) == []              # judges are OpenAI
+    cfg.llm.judge.provider = "ollama"
+    assert cli.ollama_models("eval", cfg) == [cfg.llm.judge.model]
+
+
+# --------------------------------------------------------------------------------------
+# main: what happens around every stage
+# --------------------------------------------------------------------------------------
+
+def test_main_runs_stage_saves_config_and_logs(config_file, calls, tmp_path):
+    cli.main(["parse", "--config", str(config_file), "--limit", "2"])
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["target"] == "chunkeval.corpus.parsing:run"
+    assert isinstance(call["cfg"], Config) and isinstance(call["secrets"], Secrets)
+    assert call["options"] == {"corpora": ["papers", "reports"], "limit": 2}
+
+    run = tmp_path / "runs" / call["cfg"].run_id
+    assert (run / "config.yaml").exists()
+    logs = list((run / "logs").glob("parse_*.log"))
+    assert len(logs) == 1 and "stage parse done" in logs[0].read_text(encoding="utf-8")
+
+
+def test_main_runs_all_targets_in_order(config_file, calls):
+    cli.main(["retrieve", "--config", str(config_file)])
+    assert [c["target"] for c in calls] == list(cli.STAGES["retrieve"].targets)
+    assert all(c["options"] == {} for c in calls)
+
+
+def test_main_stage_failure_exits_1_and_logs_traceback(config_file, monkeypatch, tmp_path):
+    def broken(cfg, secrets, **options):
+        raise ValueError("boom")
+    monkeypatch.setattr(cli, "resolve", lambda target: broken)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["parse", "--config", str(config_file)])
+    assert e.value.code == 1
+    log = next((tmp_path / "runs").rglob("parse_*.log")).read_text(encoding="utf-8")
+    assert "stage parse failed" in log and "ValueError: boom" in log
+
+
+def test_main_ctrl_c_exits_130(config_file, monkeypatch):
+    def interrupted(cfg, secrets, **options):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cli, "resolve", lambda target: interrupted)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["parse", "--config", str(config_file)])
+    assert e.value.code == 130
+
+
+def test_main_missing_secret_stops_before_any_work(config_file, calls, monkeypatch):
+    monkeypatch.setattr(cli.config, "load_secrets", lambda: Secrets())
+    with pytest.raises(SystemExit, match="OLLAMA_BASE_URL"):
+        cli.main(["gen-qa", "--config", str(config_file)])
+    assert calls == []
+
+
+def test_main_llm_stage_preflight_and_unload(config_file, calls, ollama):
+    cli.main(["gen-qa", "--config", str(config_file), "--corpus", "papers"])
+    assert ollama[0][0] == "check"                           # preflight before the stage
+    assert calls and calls[0]["options"] == {"corpora": ["papers"], "limit": None}
+    assert ollama[-1][0] == "unload"                         # GPU freed after it
+
+
+def test_main_unloads_even_when_stage_fails(config_file, monkeypatch, ollama):
+    def broken(cfg, secrets, **options):
+        raise RuntimeError("generation crashed")
+    monkeypatch.setattr(cli, "resolve", lambda target: broken)
+    with pytest.raises(SystemExit):
+        cli.main(["gen-qa", "--config", str(config_file)])
+    assert any(event == "unload" for event, _ in ollama)
+
+
+def test_main_non_llm_stage_never_touches_ollama(config_file, calls, ollama):
+    cli.main(["chunk", "--config", str(config_file)])
+    assert ollama == []
