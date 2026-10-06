@@ -10,14 +10,29 @@ paths:
   runs_dir: "runs"
   # Docling needs the ORIGINAL PDFs, not the extracted_text JSONs.
   corpora:
-    papers: "data/papers"
-    reports: "data/reports"
+    papers: "data/corpora/papers"
+    reports: "data/corpora/reports"
 
 parsing:
-  # Which Docling item labels to drop when building the canonical text
-  # (page furniture breaks chunks in reports — see docx "Papers vs Reports").
-  drop_labels: ["page_header", "page_footer"]        # TODO(you): check the DocItemLabel names in your Docling version
-  skip_section_titles: ["references", "acknowledgements", "acknowledgments", "table of contents"]
+  # Allowlist of Docling item labels that become text in CanonicalDoc; every other label is ignored.
+  # v1 = headings + running text. "caption" and "footnote" also work (just add them here);
+  # tables need parsing.table_text first. Page headers/footers never reach this filter: Docling
+  # puts them in its "furniture" layer and parse_pdf reads the body layer only.
+  include_labels: ["title", "section_header", "text", "paragraph", "list_item"]
+  # Heading levels (Docling reports level 1 for every PDF heading), see parsing.infer_heading_levels:
+  #   "font_size": numbering ("2.1 Data" -> 2) where present, else the heading's font size in the PDF
+  #   "numbering": numbering only, unnumbered headings are level 1
+  #   "flat":      every heading is level 1, so sections never nest
+  heading_levels: "font_size"
+  # A PDF whose text layer exceeds either ratio is converted again with full-page OCR (see
+  # parsing.text_layer_problems). Set on the first 4 PDFs: recalibrate on the whole corpus, every
+  # parsed JSON keeps its ratios in meta.text_layer.auto. Changing them re-parses only the PDFs
+  # whose OCR decision flips.
+  ocr_max_replacement_char_ratio: 0.01     # share of "�" (fonts without Unicode map); report_16: 0.71
+  ocr_max_repeated_paragraph_ratio: 0.05   # duplicated hidden text layer; paper_4: 0.12, report_15: 0.007
+  # Sections Q-A generation skips (chunkers still index them). Matched against the whole heading,
+  # case and numbering ignored ("5. References" matches "references"), so list variants explicitly.
+  skip_section_titles: ["references", "acknowledgements", "acknowledgments", "table of contents", "contents"]
 
 embedding:
   primary: "bge_m3"                  # main grid: span metrics + RAG answers + Ragas

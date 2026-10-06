@@ -1,0 +1,7 @@
+secret:
+  ignored_matches:
+  - match: 7760e7ea79c0eb2e6b3a4e0821bb84aa56cd27a71c2a71b24c1591061f69a69f
+    name: OpenAI Project API Key v2 - .env:l.3
+  - match: ef70d770a680f57272ea0c39a31f9a4d736671712af2a80a46af087ed842a61c
+    name: Hugging Face user access token - .env:l.4
+version: 2

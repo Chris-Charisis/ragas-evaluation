@@ -120,6 +120,27 @@ def write_jsonl(path: str | Path, records: Iterable[Any]) -> int:
     return total
 
 
+def write_json(path: str | Path, record: Any) -> Path:
+    """Atomically write one record (dict or dataclass instance) as a JSON file, return its path.
+
+    Same write-then-swap as `write_jsonl`, e.g. for data/parsed/<corpus>/<doc_id>.json.
+    """
+    path = REPO_ROOT / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if dataclasses.is_dataclass(record):
+        record = dataclasses.asdict(record)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, suffix=".tmp", delete=False, encoding="utf-8") as tmp:
+        try:
+            # indent=1: one field per line keeps the file readable without doubling its size.
+            json.dump(record, tmp, ensure_ascii=False, indent=1)
+        except BaseException:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise
+    os.replace(tmp.name, path)
+    return path
+
+
 def read_jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
     """Stream records from a JSONL file (generator, so large files don't load at once).
 

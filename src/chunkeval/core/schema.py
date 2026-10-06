@@ -45,8 +45,15 @@ class Paths(StrictConfig):
         return self
 
 
+# Docling labels parsing.py can turn into text (the keys of parsing.LABEL_BLOCK_TYPES).
+DoclingLabel = Literal["title", "section_header", "text", "paragraph", "list_item", "caption", "footnote"]
+
+
 class Parsing(StrictConfig):
-    drop_labels: list[str]
+    include_labels: list[DoclingLabel] = Field(min_length=1)
+    heading_levels: Literal["font_size", "numbering", "flat"]
+    ocr_max_replacement_char_ratio: float = Field(ge=0, le=1)
+    ocr_max_repeated_paragraph_ratio: float = Field(ge=0, le=1)
     skip_section_titles: list[str]
 
 

@@ -11,6 +11,5 @@ __pycache__/
 data/
 runs/
 *.pkl
-.env
 # Added by ggshield
 .cache_ggshield
