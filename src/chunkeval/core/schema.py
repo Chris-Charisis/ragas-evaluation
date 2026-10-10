@@ -49,11 +49,20 @@ class Paths(StrictConfig):
 DoclingLabel = Literal["title", "section_header", "text", "paragraph", "list_item", "caption", "footnote"]
 
 
+class BodyRule(StrictConfig):
+    """Which part of a document becomes CanonicalDoc.text (see parsing.select_body). An empty
+    list switches its step off."""
+    start_titles: list[str] = []
+    end_titles: list[str] = []
+    drop_titles: list[str] = []
+
+
 class Parsing(StrictConfig):
     include_labels: list[DoclingLabel] = Field(min_length=1)
     heading_levels: Literal["font_size", "numbering", "flat"]
     ocr_max_replacement_char_ratio: float = Field(ge=0, le=1)
     ocr_max_repeated_paragraph_ratio: float = Field(ge=0, le=1)
+    body: dict[str, BodyRule] = {}       # per corpus; a corpus without a rule keeps its whole text
     skip_section_titles: list[str]
 
 
@@ -211,6 +220,10 @@ class Config(StrictConfig):
                     for m in self.chunking.methods for o in self.chunking.overlap]
         if self.analysis.baseline not in variants:
             raise ValueError(f"analysis.baseline '{self.analysis.baseline}' must be one of {variants}")
+
+        unknown = [c for c in self.parsing.body if c not in self.paths.corpora]
+        if unknown:
+            raise ValueError(f"parsing.body {unknown} not in paths.corpora: {list(self.paths.corpora)}")
         return self
 
     @model_validator(mode="after")

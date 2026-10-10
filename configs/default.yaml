@@ -30,8 +30,40 @@ parsing:
   # whose OCR decision flips.
   ocr_max_replacement_char_ratio: 0.01     # share of "�" (fonts without Unicode map); report_16: 0.71
   ocr_max_repeated_paragraph_ratio: 0.05   # duplicated hidden text layer; paper_4: 0.12, report_15: 0.007
-  # Sections Q-A generation skips (chunkers still index them). Matched against the whole heading,
-  # case and numbering ignored ("5. References" matches "references"), so list variants explicitly.
+  # Title lists below match the whole heading, case, numbering and punctuation ignored, plus one
+  # short trailing identifier: "5. References" -> "references", "Appendix A" -> "appendix",
+  # "Publications 2019" -> "publications". So list other variants explicitly.
+  # Which part of each document becomes CanonicalDoc.text, per corpus (see parsing.select_body);
+  # what each document lost is in its meta.body. Changing a rule re-parses that corpus.
+  body:
+    papers:
+      # Keep from the first of these headings (title, authors, affiliations, abstract dropped).
+      # Not results/discussion: a paper without an Introduction heading (Nature style) would lose
+      # its intro. None found -> kept from the beginning (logged).
+      start_titles: ["introduction", "background", "related work", "literature review",
+                     "materials and methods", "material and methods", "methods", "methodology", "theory"]
+      # ...up to the first of these after the start: a heading, or a paragraph opening with it
+      # ("Funding: ...", how MDPI prints its back matter). None found -> kept to the end (logged).
+      end_titles: ["references", "bibliography", "literature cited", "references cited",
+                   "acknowledgements", "acknowledgments", "acknowledgement", "acknowledgment",
+                   "appendix", "appendices", "annex", "annexes",
+                   "supplementary materials", "supplementary material", "supplementary information",
+                   "supplementary data", "additional file", "additional files", "additional information",
+                   "author contributions", "authors' contributions", "credit authorship contribution statement",
+                   "author information", "funding", "conflicts of interest", "conflict of interest",
+                   "competing interests", "declaration of competing interest", "disclosure statement",
+                   "declarations", "ethics declarations", "data availability", "data availability statement",
+                   "availability of data and materials", "institutional review board statement",
+                   "informed consent statement"]
+    reports:
+      # No start/end cut: reports have no fixed order. Each of these sections is dropped with
+      # its subsections, wherever it is. Candidates once the full corpus is audited:
+      # "list of donors", "board of trustees" (annual reports).
+      drop_titles: ["references", "bibliography", "literature cited", "references cited", "publications",
+                    "acknowledgements", "acknowledgments", "abbreviations", "acronyms",
+                    "abbreviations and acronyms", "acronyms and abbreviations", "list of abbreviations",
+                    "list of acronyms", "table of contents", "contents"]
+  # Sections Q-A generation skips among those parsing.body keeps (chunkers still index them).
   skip_section_titles: ["references", "acknowledgements", "acknowledgments", "table of contents", "contents"]
 
 embedding:
@@ -58,15 +90,34 @@ embedding:
       max_seq_length: 2048
       dim: 1024
 
+# `chunkeval chunk` runs EVERY combination of `methods` x `overlap` in one run (6 variants), for
+# every corpus (or those given with --corpus): one data/chunks/<corpus>/<method>_<ovl>.jsonl each,
+# plus _size_stats.json. There is no mode switch: to run a subset, shorten the two lists here (or in
+# a copy passed with --config); analysis.baseline must stay one of the remaining variants.
+# Only the sizes below are configurable. The cutting rules are fixed in code and documented in each
+# chunker's docstring (corpus/chunking/): soft target (a sentence/paragraph joins a chunk while that
+# brings it closer to target_tokens), character windows calibrated per corpus and snapped to
+# whitespace, at least one whole sentence of overlap capped at target/2, a last chunk under
+# target/2 merged into the previous one.
 chunking:
   size_tokenizer: "BAAI/bge-m3"      # ALL chunk sizes are measured in this tokenizer (one ruler for every method)
-  target_tokens: 256                 # ~200 words, matches the previous round
+  # Chosen to continue the previous round (docx: 200-word chunks, better precision/faithfulness
+  # than 350). But 256 bge-m3 tokens are ~160 words, not 200: measured 1.6 tokens/word on the 4 dev
+  # docs (161 words/chunk on papers, 160 on reports; XLM-R splits numbers, units and scientific
+  # terms finely). So v2 chunks hold ~20% less text than the docx's; 200 words would be ~320.
+  # Kept at 256 on purpose: comparisons between methods within this run are unaffected, and the
+  # docx itself only trusts within-run comparisons. Re-check words_mean in _size_stats.json once
+  # the final corpus is parsed. Not tuned either: size_sweep is the way to test other sizes.
+  target_tokens: 256
   max_tokens: 512                    # experimental cap (no longer a model limit: bge-m3 reads 8192)
   overlap_ratio: 0.12                # 10–15% recommended by the docx; sentence methods round to whole sentences
   min_section_tokens: 40             # recursive: merge smaller sibling sections (within the same parent)
   methods: ["character", "sentence", "recursive"]
   overlap: [false, true]
-  size_sweep: []                     # optional, e.g. [128, 256, 512, 1024] — deterministic metrics only
+  # NOT WIRED UP YET: no stage reads it, so setting it changes nothing. Intended: extra chunk sizes,
+  # e.g. [128, 256, 512, 1024], evaluated with the deterministic span metrics only. A possible
+  # extension after the project is complete, see README "Future work".
+  size_sweep: []
 
 weaviate:
   host: "localhost"

@@ -94,7 +94,7 @@ src/chunkeval/
 
 1. **Ground truth that doesn't depend on any chunker.** Q-A pairs are generated from paragraph groups of the Docling structure, not from one of the chunkers under test. Each answer must quote its evidence word for word. The quote is located in the canonical text and becomes a **character span**. This allows deterministic retrieval metrics, and any pair whose quote can't be found is dropped, which filters out hallucinated pairs by construction.
 2. **One canonical text per document.** Every chunker and the Q-A generator work on the same string, so all character offsets are comparable.
-3. **Chunk sizes are measured in bge-m3 tokens**, targeting 256 with a cap of 512. The cap is an experimental choice, not a model limit, since bge-m3 reads up to 8192 tokens. The grid is 3 methods (character / sentence / recursive-chapter) × overlap on/off × 2 corpora, which gives 12 collections.
+3. **Chunk sizes are measured in bge-m3 tokens**, targeting 256 with a cap of 512. The cap is an experimental choice, not a model limit, since bge-m3 reads up to 8192 tokens. 256 tokens is about 160 words on the dev docs, not the previous round's 200; the reason for keeping it is in `configs/default.yaml`. The grid is 3 methods (character / sentence / recursive-chapter) × overlap on/off × 2 corpora, which gives 12 collections.
 4. **Two embedders, stored as named vectors in the same 12 collections:**
    - **Primary: `BAAI/bge-m3`.** Used for everything: span metrics, RAG answers, Ragas. It needs no query instruction.
    - **Secondary: `Qwen/Qwen3-Embedding-0.6B`.** Only the free span metrics are computed with it. Its job is to check whether the chunker ranking holds under a different embedder, and whether the embedder or the chunker is the bigger lever. Its queries need an `Instruct: …\nQuery:` prompt (set in the config).
@@ -126,6 +126,25 @@ src/chunkeval/
 7. `evaluation/answering.py` (primary embedder only). Run a Ragas pilot on 20 questions to check cost, then the full run, then the gpt-4o bridge run.
 8. `analysis.py`, including the embedder robustness table.
 
+## Before the QA stage: audit the final corpus
+
+Both corpora may still be replaced by a different set of documents, so every setting so far was checked on the 4 dev PDFs only: paper_4, paper_8, report_15 and report_16. Once the final corpus is fixed, run `chunkeval parse` and `chunkeval chunk` on all of it and go through this list before `gen-qa`. Don't tune any of these on the dev docs.
+
+**Parsing**
+- **What each document lost:** check `meta.body` in every parsed JSON (`start`, `end`, `dropped_sections`, `chars_dropped`) and the warnings in the parse log.
+- **OCR thresholds:** recalibrate `parsing.ocr_max_*_ratio` from the `meta.text_layer.auto` ratios every parsed JSON keeps. Changing them re-parses only the PDFs whose OCR decision flips.
+- **Reports' drop list:** `parsing.body.reports.drop_titles` was built from two AfricaRice annual reports. Extend it from the full corpus (candidates are noted in the config).
+- **Garbled OCR text (seen in paper_4).** paper_4 is converted with full-page OCR because its text layer is duplicated (`repeated_paragraph_ratio` 0.12). In 7 paragraphs of sections 2, 3.1, 3.2 and 4.1, the OCR output is nonsense, e.g. "The GanbanlPlatondastenegtls initiadedbovemgonicatienebaitks…". That is about 2,100 of its 16,700 tokens (13%). report_16, also OCR'd (for unreadable fonts), came out clean.
+  - **Why it matters:** garbled chunks get indexed and compete in retrieval as noise. A Q-A unit drawn from them gives nonsense questions, and since the quote locator matches verbatim text, it can still "locate" a garbled quote. It also distorts the size stats (one garbled "sentence" alone is 529 tokens).
+  - **Detecting it:** tokens per word is a good first signal: 3.4–17 in the garbled paragraphs vs. about 1.6 in normal text. But email contact lines in the reports also reach 3–4.5, so a second signal is needed, e.g. the share of words found in an English word list. Calibrate it on the full corpus.
+  - **Options:** (a) measure it as a third `meta.text_layer` ratio and flag or drop garbled blocks; (b) retry OCR with another engine or a higher image resolution; (c) OCR only the pages with the duplicated layer and keep the text layer elsewhere; (d) exclude the document. Choose once you know how many documents of the final corpus are affected.
+
+**Chunking** (the numbers are in `data/chunks/<corpus>/_size_stats.json`)
+- **Words per chunk (`words_mean`):** about 160 words at 256 tokens on the dev docs. If it moves noticeably, update the note on `target_tokens` in `configs/default.yaml`.
+- **Small recursive chunks on reports:** on the dev docs, recursive chunks average 192 tokens (vs. 256 for the other methods), and 5% are 40 tokens or less. Reports have many tiny sections (office addresses, "ISBN:", "Writing:"). Check how common small chunks are on the full corpus. The setting is `chunking.min_section_tokens`, which merges small sibling sections under the same parent only. Raising it trades section purity for size.
+- **Character window:** it is calibrated per corpus on every run (1,073 chars for papers and 1,101 for reports on the dev docs). Check that the two values stay close, and that the chunk log has no "window … > max_tokens" warnings.
+- **Sentence overlap:** it averages 42–47 tokens vs. 31 for the character windows, because it repeats at least one whole sentence. That rule is deliberate (the docx suggests a 1-sentence overlap). Report the measured `overlap_tokens_mean` next to the results.
+
 ## Testing
 
 The tests import `chunkeval` as the installed package, so run `uv sync` once (see [Package layout](#package-layout)). pytest is in the dev dependency group, which `uv sync` installs too.
@@ -151,7 +170,8 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_llm.py](tests/test_llm.py), marker `ollama` | Preflight (`check_ollama`), JSON answers from every local role, determinism, resume after an interrupted run, and unloading. Also pins the Ollama behaviour the code relies on: `reasoning_effort="none"` turns Qwen's thinking off, and too-long prompts are truncated silently. | Ollama running, models pulled, `OLLAMA_BASE_URL` |
 | [tests/test_cli.py](tests/test_cli.py) | Every stage in `cli.STAGES` points to a `run` that accepts the options the CLI passes. Argument parsing, and what `main` does around a stage: config saved, log file written, exit codes 1 and 130, missing secrets stop the run before any work, and the Ollama check before and unload after an LLM stage, even when it fails. | nothing |
 | [tests/test_llm.py](tests/test_llm.py), marker `openai` | The API key is valid and the pinned judge snapshots still exist. It only calls a free metadata endpoint, so there's **no cost**. | `OPENAI_API_KEY` |
-| `test_chunking.py`, `test_embedding.py`, … | Placeholders (`pytest.skip("TODO(you)")`) for the modules that aren't written yet. They show as `s`. | — |
+| [tests/test_chunking.py](tests/test_chunking.py) | The chunk invariants on all 6 configurations: `text == doc.text[start:end]`, full coverage, `max_tokens`, disjoint spans without overlap, the overlap budget. Also sentence boundaries around tricky abbreviations, the recursive section groups, the shared size rules (`pack`, `overlap_start`), each way `validate_chunks` fails, and the `chunk` stage's output files. When `data/parsed/` exists, the 6 configurations also run on the parsed dev docs with the config sizes. | the bge-m3 tokenizer (~20 MB, downloaded on first use) |
+| `test_embedding.py`, `test_quote_locator.py`, … | Placeholders (`pytest.skip("TODO(you)")`) for the modules that aren't written yet. They show as `s`. | — |
 
 **Good to know:**
 - **Live tests skip themselves** when their service isn't available. If Ollama isn't running, `uv run pytest` still passes, and the live tests show as skipped instead of failing.
@@ -323,6 +343,18 @@ docker compose down -v                                 # stop and DELETE all col
 - **Ollama** serves the local LLMs. It's a system service, not a Python package; the code reaches it with the `openai` client.
 
 ## Future work
+
+**Chunk-size sweep (`chunking.size_sweep`).** An optional extension for after the whole pipeline is complete, built only if we decide we want it. The config key exists and is validated, but no stage reads it yet.
+- **What:** rechunk with all 3 methods × overlap on/off at other target sizes (e.g. `[128, 256, 512, 1024]`), index them, retrieve with the same questions, and score with the span metrics only: hit@k, span recall@k, MRR, IoU/precision, context tokens. No RAG answers and no Ragas, so no API cost.
+- **Why:**
+  - It checks whether the method ranking found at 256 holds at other sizes.
+  - It tests whether 256 is a good size: 256 is inherited from the previous round, not tuned (see the comment in `configs/default.yaml`).
+  - It measures the precision/recall trade-off against chunk size on a fixed corpus and a fixed metric. That is the controlled ablation the docx says its own size comparison lacked, since chunk size, judge and corpus all changed at once.
+- **Open design points:**
+  - **Compare at equal context.** At a fixed top-k, bigger chunks win recall almost automatically. Use the budget-matched view (`retrieval.budget_tokens`, scaled per size) as the main comparison.
+  - **A cap per size.** 1024 is above `max_tokens: 512`, and the schema rejects a target above the cap. Use something like 2× the size per sweep size.
+  - **Naming.** The extra chunk files and Weaviate collections need the size in their names, which `weaviate.collection_template` can't express yet.
+  - **Weaviate memory.** Raise `GOMEMLIMIT` (see the Weaviate section).
 
 **Models partly on the CPU.** At the moment, `check_ollama` only logs a warning when a model isn't 100% on the GPU. `test_live_check_ollama` hard-codes that both generators must be 100%. There are two situations to handle:
 - **Deliberate:** a MoE generator (only about 3B parameters active per token) is partly on the CPU by design and stays usable.

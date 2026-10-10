@@ -60,6 +60,8 @@ INVALID_CONFIGS = {
     "unknown retrieval embedder": (_set("retrieval", embedders=["bge_m3", "nope"]), "nope"),
     "primary not retrieved": (_set("retrieval", embedders=["qwen3_06b"]), "primary"),
     "bad baseline": (_set("analysis", baseline="character"), "baseline"),
+    "body rule for unknown corpus": (lambda r: r["parsing"]["body"].update(thesis={}), "thesis"),
+    "unknown body rule key": (lambda r: r["parsing"]["body"]["papers"].update(stop_titles=[]), "stop_titles"),
     "template missing placeholder": (_set("weaviate", collection_template="{corpus}_{method}_v2"), "placeholders"),
     "bad vector name": (lambda r: r["embedding"]["models"].update(
         {"bge-m3": r["embedding"]["models"]["bge_m3"]}), "bge-m3"),

@@ -1,57 +1,92 @@
 """Sentence chunker — packs whole sentences up to the token target.
 
-Rule: segment `doc.text` into sentences, greedily pack them while the chunk stays <= target_tokens;
-overlap = repeat the trailing 1–2 sentences of the previous chunk (capped by overlap_ratio).
+Rule: segment `doc.text` into sentences, pack them greedily towards target_tokens (`base.pack`:
+a sentence joins while that brings the chunk closer to the target); overlap = repeat the trailing
+sentence(s) of the previous chunk, rounded to whole sentences (`base.overlap_start`).
 Why: preserves complete semantic units; in the previous round it beat word-based chunking on
 recall and faithfulness.
 
-Reuse: the packing + backward-overlap loop of `create_overlapping_chunks`
-(ragas_evaluation.py:218-261) is the right algorithm — port it, but:
+Ported from `create_overlapping_chunks` (ragas_evaluation.py:218-261), but:
   * sizes in tokens (TokenCounter), not `len(sentence.split(" "))`
-  * sentence boundaries from a real segmenter, not the regex `(?<=\\.)\\s+`
-  * keep char offsets (start of first sentence, end of last) instead of joining strings with " "
-    — joining loses the original whitespace/newlines and breaks `text == doc.text[start:end]`.
+  * sentence boundaries from pysbd, not the regex `(?<=\\.)\\s+`
+  * char offsets (start of first sentence, end of last) instead of strings joined with " ",
+    which lost the original whitespace/newlines and broke `text == doc.text[start:end]`
+  * the overlap counts towards the chunk size (the old loop reset the count without it, so
+    chunks with overlap ran over the maximum)
 """
 from __future__ import annotations
 
+import functools
+import re
 from typing import TYPE_CHECKING
 
-from chunkeval.corpus.chunking.base import Chunker
+import pysbd
+
+from chunkeval.corpus.chunking.base import Chunker, trim
 
 if TYPE_CHECKING:
-    from chunkeval.corpus.parsing import CanonicalDoc
+    from chunkeval.corpus.parsing import Block, CanonicalDoc
+
+# Block types that are one unit, never segmented: a heading is one line, and a table split into
+# rows loses its header (tables are not in CanonicalDoc.text yet, see parsing.table_text).
+ATOMIC_BLOCKS = {"heading", "table"}
+
+# Abbreviations pysbd 0.3.4 wrongly ends a sentence after ("ca. 40 countries", "Eq. (1)",
+# "approx. 3 t/ha"); "e.g.", "et al.", "Fig. 3", "Z. mays", "vs.", "cf." it already handles.
+_NO_BREAK_AFTER = re.compile(r"\b(?:ca|approx|eqs?)\.$", re.IGNORECASE)
+
+
+@functools.cache
+def _segmenter() -> pysbd.Segmenter:
+    # clean=False is essential: cleaning rewrites the text and the offsets stop matching.
+    return pysbd.Segmenter(language="en", clean=False, char_span=True)
+
+
+@functools.lru_cache(maxsize=65536)
+def _sentence_bounds(text: str) -> tuple[tuple[int, int], ...]:
+    """Sentence spans of `text`, cached: `chunk` segments every block four times (sentence and
+    recursive, each with and without overlap), and pysbd is the slow part."""
+    # Only the START of each pysbd sentence is used, and each sentence runs to the next start:
+    # pysbd silently drops a sentence it cannot find again in the text, and this way the
+    # previous sentence absorbs it instead of the text going missing.
+    starts = sorted({0, *(span.start for span in _segmenter().segment(text))})
+    spans: list[tuple[int, int]] = []
+    for a, b in zip(starts, [*starts[1:], len(text)]):
+        a, b = trim(text, a, b)
+        if a == b:
+            continue
+        if spans and _NO_BREAK_AFTER.search(text[spans[-1][0]:spans[-1][1]]):
+            spans[-1] = (spans[-1][0], b)
+        else:
+            spans.append((a, b))
+    return tuple(spans)
 
 
 def sentence_spans(text: str, base_offset: int = 0) -> list[tuple[int, int]]:
     """Return (start, end) char spans of the sentences in `text`, shifted by base_offset.
 
-    TODO(you):
-      - `pysbd.Segmenter(language="en", clean=False, char_span=True).segment(text)` returns
-        TextSpan objects with .start/.end. `clean=False` is essential: cleaning rewrites the text
-        and the offsets stop matching.
-      - pysbd handles "e.g.", "et al.", "Fig. 3", decimals — the cases the old regex broke on.
-        spaCy (`en_core_web_sm` + `doc.sents`) is the heavier alternative; pick one and test it
-        on a few nasty paragraphs from your corpus (citations, species names "Z. mays", units).
-      - Segment block-by-block (paragraphs from CanonicalDoc.blocks), not the whole document:
-        it is faster and a sentence should never span two blocks (e.g. heading + paragraph).
-      - Tables: treat a whole table block as one "sentence" (atomic) unless it is > max_tokens.
+    pysbd handles "e.g.", "et al.", "Fig. 3", "Z. mays", decimals — the cases the old regex broke
+    on — plus the fixes in _NO_BREAK_AFTER. Spans are trimmed and together cover all non-space
+    text. Call it per block (`block_sentences`): faster than the whole document, and a sentence
+    never spans two blocks (e.g. heading + paragraph).
     """
-    raise NotImplementedError
+    return [(base_offset + a, base_offset + b) for a, b in _sentence_bounds(text)]
+
+
+def block_sentences(doc: "CanonicalDoc", block: "Block") -> list[tuple[int, int]]:
+    """The units of one block in doc.text offsets: its sentences, or the whole block for a
+    heading or table (ATOMIC_BLOCKS). A unit longer than max_tokens is split later, in
+    `Chunker.pack_spans`."""
+    if block.type in ATOMIC_BLOCKS:
+        return [(block.start, block.end)]
+    return sentence_spans(doc.text[block.start:block.end], block.start)
 
 
 class SentenceChunker(Chunker):
     method = "sentence"
 
     def spans(self, doc: "CanonicalDoc") -> list[tuple[int, int]]:
-        """TODO(you):
-          - Sentences of the WHOLE document in order (this method ignores sections — that is the
-            difference to RecursiveChunker; a chunk MAY cross a heading).
-          - Greedy pack up to target_tokens. Decide: is the target a max (old behaviour, chunks end
-            up smaller on average) or a soft target? Keep it consistent with RecursiveChunker.
-          - A single sentence longer than max_tokens (long tables, reference lists) must be split
-            — fall back to token windows for that sentence only.
-          - Overlap: walk back over the previous chunk's sentences while the overlap budget
-            (overlap_ratio * target_tokens) allows — this is exactly the old `reversed(chunks[-1])`
-            loop. Guard against the infinite loop where the overlap alone fills a whole chunk.
-        """
-        raise NotImplementedError
+        """Sentences of the WHOLE document in order, packed by `pack_spans`. This method ignores
+        sections — that is the difference to RecursiveChunker: a chunk MAY cross a heading."""
+        units = [span for block in doc.blocks for span in block_sentences(doc, block)]
+        return self.pack_spans(doc.text, units)

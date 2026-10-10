@@ -9,6 +9,9 @@ Why:
   * Most importantly: every downstream component (all chunkers AND the Q-A generator) works on
     the SAME `CanonicalDoc.text`. That is what makes character offsets comparable across
     chunkers and enables the deterministic span metrics in evaluation/retrieval_metrics.py.
+  * Only the body is kept (`select_body`, cfg.parsing.body): reference lists, author details and
+    the abstract (a summary of the body, so a chunk of it that answers a question would score as
+    a miss against evidence located in the body) are neither indexed nor asked about.
 
 Reads:  PDFs from cfg.paths.corpora[<corpus>]
 Writes: data/parsed/<corpus>/<doc_id>.json
@@ -29,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from chunkeval.core.config import Secrets
-from chunkeval.core.schema import REPO_ROOT, Config
+from chunkeval.core.schema import REPO_ROOT, BodyRule, Config
 from chunkeval.core.store import write_json, write_jsonl
 
 if TYPE_CHECKING:
@@ -68,7 +71,7 @@ FRONT_MATTER_TITLE = "(front matter)"
 
 # Bump when a change in this module changes the parsed output: `parse_corpus` then parses the
 # PDFs again instead of serving the stale cached JSONs.
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 # The simple case of a duplicated text layer: a paragraph contained in the paragraph right before
 # it (or containing it) is a copy. The minimum length keeps short legitimate repeats.
@@ -129,6 +132,7 @@ class Piece:
     type: BlockType
     text: str
     level: int | None = None     # headings only, set by `infer_heading_levels`
+    font_size: float | None = None   # headings only, heading_levels="font_size" (meta.heading_font_sizes)
     source: Any = field(default=None, repr=False)   # the Docling item (page + bbox), if any
 
 
@@ -143,7 +147,9 @@ def parse_pdf(pdf_path: Path, corpus: str, cfg: Config) -> CanonicalDoc:
     3. `infer_heading_levels`: Docling reports level 1 for every PDF heading, so levels come from
        cfg.parsing.heading_levels: numbering ("2." -> 1, "2.1" -> 2, "(a)" -> one below), plus the
        font size measured in the PDF for unnumbered headings, or simply 1 everywhere ("flat").
-    4. `assemble_doc`: append the pieces with SEPARATOR, recording each block's offsets as it
+       Inferred on ALL headings, so cutting the front/back matter in step 4 changes no level.
+    4. `select_body`: keep the body only, by cfg.parsing.body[corpus] (what went is in meta.body).
+    5. `assemble_doc`: append the pieces with SEPARATOR, recording each block's offsets as it
        goes, then build the section tree and validate the invariants.
 
     Docling's own chunkers (HybridChunker) are deliberately not used: they would be a 4th
@@ -172,8 +178,23 @@ def parse_pdf(pdf_path: Path, corpus: str, cfg: Config) -> CanonicalDoc:
     headings = [p for p in pieces if p.type == "heading"]
     mode = cfg.parsing.heading_levels
     sizes = heading_font_sizes(pdf_path, ddoc, [p.source for p in headings]) if mode == "font_size" else None
-    for piece, level in zip(headings, infer_heading_levels([p.text for p in headings], mode, sizes)):
-        piece.level = level
+    levels = infer_heading_levels([p.text for p in headings], mode, sizes)
+    for piece, level, size in zip(headings, levels, sizes or [None] * len(headings)):
+        piece.level, piece.font_size = level, size
+
+    rule = cfg.parsing.body.get(corpus)
+    pieces, body = select_body(pieces, rule)
+    if not pieces:
+        raise ValueError(f"{pdf_path.name}: no text left after parsing.body.{corpus}")
+    if rule and rule.start_titles and body["start"] is None:
+        log.warning("%s: no start heading (%s), body kept from the beginning",
+                    pdf_path.name, ", ".join(rule.start_titles))
+    if rule and rule.end_titles and body["end"] is None:
+        log.warning("%s: no back matter found, body kept to the end", pdf_path.name)
+    if body["chars_dropped"] > sum(len(p.text) for p in pieces):     # most of a doc is never "back matter"
+        log.warning("%s: parsing.body.%s dropped most of the text (%d chars; start=%r, end=%r)",
+                    pdf_path.name, corpus, body["chars_dropped"], body["start"], body["end"])
+    kept_headings = [p for p in pieces if p.type == "heading"]
 
     try:
         source = str(pdf_path.resolve().relative_to(REPO_ROOT))
@@ -190,9 +211,12 @@ def parse_pdf(pdf_path: Path, corpus: str, cfg: Config) -> CanonicalDoc:
         "include_labels": sorted(include),
         "heading_levels": mode,
         # font_size mode: measured size per heading section ("s1", "s2"... = headings in order)
-        **({"heading_font_sizes": {f"s{i}": s for i, s in enumerate(sizes, start=1)}} if sizes is not None else {}),
+        **({"heading_font_sizes": {f"s{i}": p.font_size for i, p in enumerate(kept_headings, start=1)}}
+           if sizes is not None else {}),
         "skipped_labels": dict(sorted(skipped.items())),   # body items not kept, by label
         "duplicates_dropped": duplicates,
+        "body_rule": rule.model_dump() if rule else None,  # cache key, see _is_up_to_date
+        "body": body,
     }
     doc = assemble_doc(pdf_path.stem, corpus, doc_title(ddoc, fallback=pdf_path.stem), pieces, meta)
     log.info("%s: %d pages, %d blocks, %d sections, %d chars (ocr=%s)",
@@ -479,6 +503,69 @@ def doc_title(ddoc: DoclingDocument, fallback: str) -> str:
     return max(first_page, key=len, default="") or fallback
 
 
+# The label of a paragraph that opens with one: "Funding: This research was funded by ...".
+_LEAD_LABEL = re.compile(r"([^:]{1,50}):\s")
+
+
+def select_body(pieces: list[Piece], rule: BodyRule | None) -> tuple[list[Piece], dict[str, Any]]:
+    """The pieces worth indexing and asking about, by one corpus's rule (cfg.parsing.body).
+
+    Three steps, each off while its title list is empty (titles match as in `title_matches`):
+      1. start_titles: drop everything before the first such heading. Papers: the sections that
+         can open a paper (Introduction, Background, Methods...), so the title, authors,
+         affiliations and abstract go. None -> no cut.
+      2. end_titles: drop everything from the first such heading after the start, or the first
+         paragraph whose lead label is one ("Funding: ...": MDPI prints its back matter as
+         paragraphs inside the Conclusions section). None -> no cut. A cut and not a per-section
+         drop, because a paper's back matter runs to the end and its headings are often unlisted
+         ("Downloads", "Submit your manuscript...") or wrongly nested (paper_8).
+      3. drop_titles: drop each such section with its subsections (up to the next heading of the
+         same or a higher level, as in `build_section_tree`), wherever it is. Reports have no
+         fixed order (acronyms before the introduction, references after each chapter), so a cut
+         there could lose real content.
+    Returns the kept pieces and what was cut (stored as meta.body, to audit a rule on a corpus).
+    """
+    body: dict[str, Any] = {"start": None, "end": None, "dropped_sections": [], "chars_dropped": 0}
+    if rule is None:
+        return pieces, body
+    chars = sum(len(p.text) for p in pieces)
+
+    if rule.start_titles:
+        start = next((i for i, p in enumerate(pieces)
+                      if p.type == "heading" and title_matches(p.text, rule.start_titles)), None)
+        if start is not None:
+            body["start"] = pieces[start].text
+            pieces = pieces[start:]
+
+    if rule.end_titles:
+        for i, p in enumerate(pieces):
+            if p.type == "heading":
+                marker = p.text
+            elif p.type == "paragraph" and (m := _LEAD_LABEL.match(p.text)):
+                marker = m.group(1)
+            else:
+                continue
+            if title_matches(marker, rule.end_titles):
+                body["end"] = marker
+                pieces = pieces[:i]
+                break
+
+    if rule.drop_titles:
+        kept: list[Piece] = []
+        drop_level: int | None = None        # level of the section being dropped, if any
+        for p in pieces:
+            if p.type == "heading" and (drop_level is None or (p.level or 1) <= drop_level):
+                drop_level = (p.level or 1) if title_matches(p.text, rule.drop_titles) else None
+                if drop_level is not None:
+                    body["dropped_sections"].append(p.text)
+            if drop_level is None:
+                kept.append(p)
+        pieces = kept
+
+    body["chars_dropped"] = chars - sum(len(p.text) for p in pieces)
+    return pieces, body
+
+
 def assemble_doc(doc_id: str, corpus: str, title: str, pieces: list[Piece],
                  meta: dict[str, Any] | None = None) -> CanonicalDoc:
     """Join the pieces into the canonical text, recording each block's offsets while appending.
@@ -578,16 +665,27 @@ def normalise_title(title: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", title.lower()).split())
 
 
+def title_matches(title: str, titles: list[str]) -> bool:
+    """Whether `title` is one of `titles`, both sides through `normalise_title`.
+
+    Whole titles, not prefixes ("contents" must not match "Contents of soil nitrogen"), but one
+    short trailing identifier is allowed: "Appendix A", "Annex 2" and "Publications 2019" match
+    "appendix", "annex" and "publications".
+    """
+    wanted = {normalise_title(t) for t in titles}
+    title = normalise_title(title)
+    head, _, last = title.rpartition(" ")
+    return title in wanted or (head in wanted and len(last) <= 4)
+
+
 def is_skippable_section(section: Section, cfg: Config) -> bool:
     """True for References / Acknowledgements / TOC etc. (used by Q-A unit sampling, NOT chunking).
 
-    Chunkers still index these sections (production indexes them too); we only avoid generating
-    questions from them. Matches whole titles after `normalise_title`, not prefixes ("contents"
-    must not match "Contents of soil nitrogen"), and checks the whole path, so the subsections
-    of a skipped section are skipped too.
+    For the sections cfg.parsing.body leaves in the text: chunkers still index them, we only
+    avoid generating questions from them. Titles match as in `title_matches`; the whole path is
+    checked, so the subsections of a skipped section are skipped too.
     """
-    skip = {normalise_title(t) for t in cfg.parsing.skip_section_titles}
-    return any(normalise_title(title) in skip for title in section.path)
+    return any(title_matches(title, cfg.parsing.skip_section_titles) for title in section.path)
 
 
 def parse_corpus(corpus: str, cfg: Config, limit: int | None = None) -> list[Path]:
@@ -615,7 +713,7 @@ def parse_corpus(corpus: str, cfg: Config, limit: int | None = None) -> list[Pat
     cached = 0
     for i, pdf in enumerate(pdfs, start=1):
         out = out_dir / f"{pdf.stem}.json"
-        if _is_up_to_date(out, cfg):
+        if _is_up_to_date(out, corpus, cfg):
             paths.append(out)
             cached += 1
             continue
@@ -635,21 +733,23 @@ def parse_corpus(corpus: str, cfg: Config, limit: int | None = None) -> list[Pat
     return paths
 
 
-def _is_up_to_date(path: Path, cfg: Config) -> bool:
+def _is_up_to_date(path: Path, corpus: str, cfg: Config) -> bool:
     """Whether a cached JSON is what `parse_pdf` would produce now: same parser code
-    (PARSER_VERSION), Docling version, include_labels and heading_levels, and the same OCR
-    decision under the current thresholds. The first pass's ratios are stored, so a threshold
-    change only re-parses the PDFs whose decision flips. A missing or unreadable file is never
-    up to date."""
+    (PARSER_VERSION), Docling version, include_labels, heading_levels and body rule, and the
+    same OCR decision under the current thresholds. The first pass's ratios are stored, so a
+    threshold change only re-parses the PDFs whose decision flips. A missing or unreadable file
+    is never up to date."""
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))["meta"]
         wants_ocr = bool(text_layer_problems(meta["text_layer"]["auto"], cfg))
     except (OSError, ValueError, KeyError, TypeError):
         return False
+    rule = cfg.parsing.body.get(corpus)
     return (meta.get("parser_version") == PARSER_VERSION
             and meta.get("parser") == _parser_name()
             and meta.get("include_labels") == sorted(cfg.parsing.include_labels)
             and meta.get("heading_levels") == cfg.parsing.heading_levels
+            and meta.get("body_rule") == (rule.model_dump() if rule else None)
             and meta.get("ocr") == ("full_page" if wants_ocr else "auto"))
 
 
