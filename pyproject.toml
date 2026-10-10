@@ -56,11 +56,12 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Live tests skip themselves when their service is unavailable. Fast offline run only:
-#   pytest -m "not ollama and not openai and not gpu"
+#   pytest -m "not ollama and not openai and not gpu and not weaviate"
 markers = [
     "ollama: talks to the local Ollama server and loads models into the GPU (slow)",
     "openai: calls the OpenAI API (free metadata endpoints only, needs OPENAI_API_KEY)",
     "gpu: loads embedding models onto the GPU",
+    "weaviate: talks to the local Weaviate (docker compose up -d); creates and deletes *_pytest collections only",
 ]
 
 # ---------------------------------------------------------------------------

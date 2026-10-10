@@ -41,6 +41,7 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 - **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
 - **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed` has `--corpus` only.
 - **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`).
+- **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [What `index` builds](#what-index-builds)).
 
 **What the CLI does around every stage,** so stage code doesn't have to:
 1. It validates the config and checks this stage's secrets, so a problem stops the run in the first second.
@@ -153,8 +154,9 @@ The tests import `chunkeval` as the installed package, so run `uv sync` once (se
 
 ```bash
 uv run pytest                                   # everything (~35 s with Ollama running and a free GPU)
-uv run pytest -m "not ollama and not openai and not gpu"   # offline tests only (~5 s): run after every change
+uv run pytest -m "not ollama and not openai and not gpu and not weaviate"   # offline tests only (~5 s): run after every change
 uv run pytest -m gpu                            # embedding models on the GPU (~10 s): run after changing embedding.py or the models
+uv run pytest -m weaviate                       # the local Weaviate (~15 s): run after changing indexing.py or the Weaviate version
 uv run pytest -m ollama                         # live Ollama tests only: run after upgrading Ollama or changing models
 uv run pytest -m openai                         # OpenAI key + judge snapshots: run before an eval run
 uv run pytest tests/test_store.py -v            # one file, one line per test
@@ -176,6 +178,8 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_chunking.py](tests/test_chunking.py) | The chunk invariants on all 6 configurations: `text == doc.text[start:end]`, full coverage, `max_tokens`, disjoint spans without overlap, the overlap budget. Also sentence boundaries around tricky abbreviations, the recursive section groups, the shared size rules (`pack`, `overlap_start`), each way `validate_chunks` fails, and the `chunk` stage's output files. When `data/parsed/` exists, the 6 configurations also run on the parsed dev docs with the config sizes. | the bge-m3 tokenizer (~20 MB, downloaded on first use) |
 | [tests/test_embedding.py](tests/test_embedding.py), offline | The vector cache and the `embed` stage with a fake embedder. Each model is loaded once and only when a file needs it. A re-run embeds only changed chunk files: the cache compares content hashes, not mtimes, and a changed query prompt doesn't count. A new model revision re-embeds that model's files. A crashed run resumes. The loader refuses vectors whose chunk_ids differ (order included) or whose settings are stale. The Ollama guard names the loaded models and passes when Ollama is unreachable. | nothing |
 | [tests/test_embedding.py](tests/test_embedding.py), marker `gpu` | Both real models: loaded at the pinned revision; float32 unit-norm output; Qwen3's instruction applied to queries only; two different vector spaces; a 3-passage retrieval sanity check; the same vector with and without padding (pooling + padding side); too-long input raises instead of being truncated; every chunk in `data/chunks/` fits each model's `max_seq_length`. | a CUDA GPU with no Ollama model loaded; the models (~4.5 GB bge-m3, ~1.2 GB Qwen3, downloaded on first use) |
+| [tests/test_indexing.py](tests/test_indexing.py), offline | Every chunk field but `meta` is a property, and only `text` is searchable. `--limit` takes the first documents by doc_id, with their own vectors. Missing chunks or vectors name the stage to run. Provenance changes with the chunks, the embedder settings and `--limit`. | nothing |
+| [tests/test_indexing.py](tests/test_indexing.py), marker `weaviate` | On 6 fake chunks with hash vectors: the collection gets both named vectors (flat, cosine) and its provenance, and every object matches its chunk and cached vectors. A chunk's vector finds that chunk first in its own space. doc_id filters match whole ids, and BM25 ignores section titles. A re-run skips an up-to-date collection and refuses a stale, incomplete or hand-made one until `--recreate`. Verification catches swapped names and shifted rows, and failed inserts raise. | Weaviate running (`docker compose up -d`), `WEAVIATE_API_KEY`; touches only `*_pytest` collections |
 | `test_quote_locator.py`, `test_retrieval_metrics.py` | Placeholders (`pytest.skip("TODO(you)")`) for the modules that aren't written yet. They show as `s`. | — |
 
 **Good to know:**
@@ -186,7 +190,7 @@ uv run pytest -k crash                          # tests whose name contains "cra
 - **A generator must be 100% on the GPU.** `test_live_check_ollama` fails if `qa_generator` or `rag_generator` is partly offloaded to the CPU. If you switch to one of the MoE generators, which offload by design, relax that assertion.
 - **Writing new tests:**
   - Use the fixtures from `conftest.py`: `cfg` (a validated config) and `raw_config` (the YAML as a dict, for building invalid configs).
-  - Mark tests that need a service: `@pytest.mark.ollama`, `@pytest.mark.openai`, or `@pytest.mark.gpu` for embedding models.
+  - Mark tests that need a service: `@pytest.mark.ollama`, `@pytest.mark.openai`, `@pytest.mark.weaviate`, or `@pytest.mark.gpu` for embedding models.
   - The markers are registered in `pyproject.toml`.
 
 ## Local LLMs (Ollama)
@@ -331,6 +335,21 @@ docker compose down -v                                 # stop and DELETE all col
 - **Memory:** `GOMEMLIMIT=6GiB` is a soft cap. 12 collections with two 1024-dim vectors per chunk, from a few hundred documents, need a few GB at most. Raise it if you run the chunk-size sweep.
 
 **Collection names:** `{corpus}_{method}_{overlap}_v2` (see `configs/default.yaml`). Weaviate capitalises the first letter, so `papers_sentence_overlap_v2` is stored as `Papers_sentence_overlap_v2`. `config.collection_name` should normalise names so lookups match.
+
+### What `index` builds
+
+```bash
+uv run chunkeval index --corpus papers --limit 1    # smoke test: the chunks of one paper
+uv run chunkeval index --recreate                   # all 12 collections, replacing the smoke test
+```
+
+- **One object per chunk.** Its properties are the chunk's fields (all but `meta`), and its uuid is derived from `chunk_id`. It carries both named vectors, read from the `embed` cache; `index` never loads a model, so it can run while Ollama holds the GPU.
+- **Exact search.** Both named vectors use a flat (brute-force) index with cosine distance, not HNSW. An approximate index can miss a true neighbour, and which one depends on insertion order, so a rebuild could move the retrieval metrics. At ~55 chunks per document, a collection is a few thousand objects, where brute force takes milliseconds per query.
+- **BM25 sees only `text`.** The ids and `section_path` are filterable (matched whole, so `paper_4` doesn't match `paper_4_suppl`) but not searchable, so the hybrid follow-up scores only the text the generator reads.
+- **Provenance and re-runs.** Each collection's description holds a JSON record of what it was built from: a hash of the chunks, `--limit`, and the settings of both embedders (model id, revision, …). On a re-run:
+  - a collection with the same provenance that passes verification is **skipped**;
+  - any other existing collection is **refused**, with the inputs that differ named (e.g. after `chunk` or `embed` changed something, or after a `--limit` smoke test). `--recreate` rebuilds it.
+- **Verification after every build.** The object count must equal the chunk count. For 8 objects spread over the collection, the properties and both stored vectors must equal the chunk file and the cache. Both models give 1024-dim unit vectors, so this is what catches swapped names or rows shifted by one. Any failure stops the stage.
 
 **Problems:**
 

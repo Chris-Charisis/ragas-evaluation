@@ -52,7 +52,7 @@ STAGES: dict[str, Stage] = {
     "embed": Stage("Stage 2b: embed chunks with bge-m3 (primary) and Qwen3-Embedding (secondary), cached (GPU)",
                    ("chunkeval.corpus.embedding:run",), ("corpora", "embedders")),
     "index": Stage("Stage 3: load chunks + both named vectors into the v2 Weaviate collections",
-                   ("chunkeval.corpus.indexing:run",), ("corpora", "limit")),
+                   ("chunkeval.corpus.indexing:run",), ("corpora", "limit", "recreate")),
     "gen-qa": Stage("Stage 4: generate Q-A pairs with located evidence spans",
                     ("chunkeval.qa.generation:run",), ("corpora", "limit")),
     "filter-qa": Stage("Stage 5: deterministic checks + critic + dedup + final sample",
@@ -66,7 +66,7 @@ STAGES: dict[str, Stage] = {
     "report": Stage("Stage 9: tables with bootstrap CIs, paired diffs, breakdowns",
                     ("chunkeval.analysis:run",)),
 }
-# TODO(you), with each stage: --embedder for retrieve, --recreate for index,
+# TODO(you), with each stage: --embedder for retrieve,
 #   --pilot N / --bridge for eval (ragas_eval.run already takes `pilot` and `bridge`).
 
 
@@ -88,6 +88,9 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
     "embedders": lambda p: p.add_argument(
         "--embedder", dest="embedders", action="append", metavar="NAME",
         help="only this embedder (repeatable); default: embedding.primary, then embedding.secondary"),
+    "recreate": lambda p: p.add_argument(
+        "--recreate", action="store_true",
+        help="delete and rebuild collections that already exist; default: skip up-to-date ones, refuse stale ones"),
 }
 
 

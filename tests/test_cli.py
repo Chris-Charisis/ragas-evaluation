@@ -58,7 +58,7 @@ def test_stage_targets_accept_the_cli_options(command, cfg):
     for required parameters) — before anyone runs the stage for real.
     """
     stage = cli.STAGES[command]
-    options = {"corpora": ["papers"], "limit": 1, "embedders": ["bge_m3"]}
+    options = {"corpora": ["papers"], "limit": 1, "embedders": ["bge_m3"], "recreate": True}
     for target in stage.targets:
         function = cli.resolve(target)
         inspect.signature(function).bind(cfg, Secrets(), **{o: options[o] for o in stage.options})
@@ -94,6 +94,12 @@ def test_limit_must_be_positive_int(value):
 def test_default_corpora_are_all_configured(cfg):
     args = cli.build_parser().parse_args(["parse"])
     assert cli.stage_options(cli.STAGES["parse"], args, cfg) == {"corpora": list(cfg.paths.corpora), "limit": None}
+
+
+def test_recreate_is_off_unless_given(cfg):
+    for argv, recreate in ((["index"], False), (["index", "--recreate"], True)):
+        args = cli.build_parser().parse_args(argv)
+        assert cli.stage_options(cli.STAGES["index"], args, cfg)["recreate"] is recreate
 
 
 def test_repeated_corpus_deduplicated_in_order(cfg):
