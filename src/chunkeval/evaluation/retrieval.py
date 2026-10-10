@@ -48,7 +48,8 @@ def encode_questions(cfg: Config, embedder_name: str, corpus: str,
         for bge-m3, the "Instruct: ...\\nQuery:" prompt for Qwen3). Never call `encode_documents`
         on questions: for Qwen3 that silently drops the instruction and costs retrieval quality.
       - Cache the matrix + question ids (same alignment check as for chunk vectors), keyed by the
-        embedder name AND a hash of the query prompt — changing the instruction must invalidate it.
+        embedder name AND a hash of the query prompt and the model revision — changing either must
+        invalidate it, or queries would no longer match the document vectors' model.
       - Unload the model afterwards (Embedder.unload) before loading the next one.
     """
     raise NotImplementedError

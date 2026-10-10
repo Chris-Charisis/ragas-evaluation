@@ -46,7 +46,7 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
     the character window is calibrated on the docs being chunked, so a `--limit` smoke test gets a
     slightly different window than the full corpus.
     """
-    counter = load_counter(cfg.chunking.size_tokenizer)
+    counter = load_counter(cfg.chunking.size_tokenizer, cfg.chunking.size_tokenizer_revision)
     for corpus in corpora:
         parsed_dir = cfg.paths.data_dir / "parsed" / corpus
         paths = sorted(parsed_dir.glob("*.json"))[:limit]

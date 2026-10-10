@@ -52,7 +52,7 @@ def create_collection(client, name: str, vector_names: list[str], recreate: bool
       - Distance: both models produce normalised vectors → cosine. Set it explicitly in the vector
         index config (`Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE)`) rather
         than relying on the default, so the choice is visible in the code.
-      - Put the embedder model_ids (and the size tokenizer) in the collection `description` —
+      - Put the embedder model_ids and revisions (and the size tokenizer + its revision) in the collection `description` —
         a cheap provenance record you can read back with `collection.config.get()`.
       - All named vectors must exist at creation: decide whether to require BOTH embeddings to be
         cached before indexing (simplest), or to add the secondary later (newer servers support

@@ -25,6 +25,9 @@ REPO_ROOT = _find_repo_root()
 # Embedding model names double as Weaviate named-vector names: letters, digits, underscores only.
 VectorName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
 
+# A full Hugging Face Hub commit hash. Not a branch or tag ("main" moves when the authors push).
+CommitHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
+
 
 class StrictConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -68,6 +71,7 @@ class Parsing(StrictConfig):
 
 class EmbModel(StrictConfig):
     model_id: str
+    revision: CommitHash
     query_prompt: str
     document_prompt: str
     max_seq_length: int = Field(gt=0)
@@ -82,14 +86,19 @@ class Embedding(StrictConfig):
 
     @model_validator(mode="after")
     def check_and_resolve(self):
-        unknown = [n for n in [self.primary, *self.secondary] if n not in self.models]
+        names = [self.primary, *self.secondary]
+        unknown = [n for n in names if n not in self.models]
         if unknown:
             raise ValueError(f"unknown embedder(s) {unknown}; defined in models: {list(self.models)}")
+        # `embed` would embed (and the analysis count) such an embedder twice
+        if len(set(names)) != len(names):
+            raise ValueError(f"an embedder is listed twice in primary + secondary: {names}")
         self.cache_dir = REPO_ROOT / self.cache_dir
         return self
 
 class Chunking(StrictConfig):
     size_tokenizer: str
+    size_tokenizer_revision: CommitHash
     target_tokens: int = Field(gt=0)
     max_tokens: int = Field(gt=0)
     overlap_ratio: float = Field(ge=0, lt=1)
@@ -215,6 +224,13 @@ class Config(StrictConfig):
         # answering and Ragas run on the primary embedder's retrieval results
         if self.embedding.primary not in self.retrieval.embedders:
             raise ValueError(f"embedding.primary '{self.embedding.primary}' missing from retrieval.embedders")
+        # The size tokenizer is an embedder's own (bge-m3): pinned to the same commit, so updating
+        # one pin without the other fails here instead of measuring chunks with another version.
+        c = self.chunking
+        for name, m in models.items():
+            if m.model_id == c.size_tokenizer and m.revision != c.size_tokenizer_revision:
+                raise ValueError(f"chunking.size_tokenizer_revision ({c.size_tokenizer_revision}) differs from "
+                                 f"embedding.models.{name}.revision ({m.revision}), the same model {m.model_id}")
 
         variants = [f"{m}_{'overlap' if o else 'no_overlap'}"
                     for m in self.chunking.methods for o in self.chunking.overlap]

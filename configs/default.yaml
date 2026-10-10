@@ -73,15 +73,23 @@ embedding:
   cache_dir: "data/embeddings"
   # `name` doubles as the Weaviate named-vector name (letters, digits, underscores only).
   # Both models output 1024-dim normalised vectors (cosine) — dimension checks can't tell them apart.
+  # `revision`: the Hub commit to load (full 40-char hash; a branch like "main" is rejected). Without
+  # it every load takes the latest commit, so an upstream push could change the vectors mid-experiment,
+  # e.g. queries embedded by a newer model than the documents they are searched against.
+  # Changing it makes `chunkeval embed` re-embed every chunk file of that model.
+  # To update: pick a commit on the model page (Files and versions -> History), or print the latest with
+  #   uv run python -c "from huggingface_hub import HfApi; print(HfApi().model_info('BAAI/bge-m3').sha)"
   models:
     bge_m3:
       model_id: "BAAI/bge-m3"        # 8192-token context, CLS pooling, dense output used here
+      revision: "5617a9f61b028005a4858fdac845db406aefb181"   # main on 2026-10-11 (last changed 2024-07-03)
       query_prompt: ""               # bge-m3 needs no query instruction
       document_prompt: ""
       max_seq_length: 2048           # far above any chunk; caps batch memory
       dim: 1024
     qwen3_06b:
       model_id: "Qwen/Qwen3-Embedding-0.6B"   # 32k context, last-token pooling
+      revision: "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"   # main on 2026-10-11 (last changed 2026-04-20)
       # Task-specific instruction, format "Instruct: <task>\nQuery:" (the question follows directly).
       # One instruction for both corpora, so papers vs reports differ only in the documents.
       # Changing it changes Qwen's retrieval results — the query-embedding cache keys on its hash.
@@ -101,6 +109,10 @@ embedding:
 # target/2 merged into the previous one.
 chunking:
   size_tokenizer: "BAAI/bge-m3"      # ALL chunk sizes are measured in this tokenizer (one ruler for every method)
+  # Pinned like embedding.models.*.revision: a new tokenizer version could change token counts and
+  # so chunk boundaries. Must equal embedding.models.bge_m3.revision (checked when the config loads),
+  # so chunks are measured with exactly the tokenizer the primary embedder reads them with.
+  size_tokenizer_revision: "5617a9f61b028005a4858fdac845db406aefb181"
   # Chosen to continue the previous round (docx: 200-word chunks, better precision/faithfulness
   # than 350). But 256 bge-m3 tokens are ~160 words, not 200: measured 1.6 tokens/word on the 4 dev
   # docs (161 words/chunk on papers, 160 on reports; XLM-R splits numbers, units and scientific

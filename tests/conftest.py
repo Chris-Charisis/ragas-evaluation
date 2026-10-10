@@ -2,10 +2,6 @@
 
 `chunkeval` is imported as the installed (editable) package: run `uv sync` once, then
 `uv run pytest`. pytest itself is in the dev dependency group.
-
-TODO(you): add fixtures here as you need them, e.g.
-  - `embedders`: bge-m3 + Qwen3-Embedding-0.6B loaded once per session — mark the tests that use
-    them (e.g. `@pytest.mark.gpu`) so the fast tests can run without loading 2 models.
 """
 import pytest
 import yaml
@@ -25,9 +21,43 @@ def counter():
     from chunkeval.corpus.chunking.base import load_counter
 
     try:
-        return load_counter(load_config(DEFAULT_CONFIG).chunking.size_tokenizer)
+        chunking = load_config(DEFAULT_CONFIG).chunking
+        return load_counter(chunking.size_tokenizer, chunking.size_tokenizer_revision)
     except OSError as e:
         pytest.skip(f"size tokenizer unavailable: {e}")
+
+
+@pytest.fixture(scope="module")
+def embedders():
+    """Every configured embedder (bge-m3, Qwen3-Embedding) on the GPU, by name. Mark the tests
+    that use it `@pytest.mark.gpu`.
+
+    Loaded once per test MODULE (~10 s) and unloaded at its end — not per session, because the
+    live Ollama tests in test_llm.py need that GPU memory later in the same run. Skips when there
+    is no CUDA GPU, when Ollama holds the GPU (`ollama ps` not empty), or when a model can't be
+    loaded (offline before the first download: ~4.5 GB for bge-m3, ~1.2 GB for Qwen3).
+    """
+    import torch
+    from chunkeval.core.config import load_secrets
+    from chunkeval.corpus.embedding import Embedder, check_gpu_free, load_specs
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA GPU")
+    try:
+        check_gpu_free(load_secrets())
+    except RuntimeError as e:
+        pytest.skip(str(e))
+    loaded = {}
+    try:
+        for name, spec in load_specs(load_config(DEFAULT_CONFIG)).items():
+            loaded[name] = Embedder(spec)
+    except OSError as e:
+        for embedder in loaded.values():
+            embedder.unload()
+        pytest.skip(f"embedding model unavailable: {e}")
+    yield loaded
+    for embedder in loaded.values():
+        embedder.unload()
 
 
 @pytest.fixture

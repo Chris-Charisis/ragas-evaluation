@@ -65,6 +65,11 @@ INVALID_CONFIGS = {
     "template missing placeholder": (_set("weaviate", collection_template="{corpus}_{method}_v2"), "placeholders"),
     "bad vector name": (lambda r: r["embedding"]["models"].update(
         {"bge-m3": r["embedding"]["models"]["bge_m3"]}), "bge-m3"),
+    "primary also secondary": (_set("embedding", secondary=["qwen3_06b", "bge_m3"]), "listed twice"),
+    "revision is a branch": (lambda r: r["embedding"]["models"]["bge_m3"].update(revision="main"), "revision"),
+    "revision missing": (lambda r: r["embedding"]["models"]["qwen3_06b"].pop("revision"), "revision"),
+    "tokenizer revision is a branch": (_set("chunking", size_tokenizer_revision="main"), "size_tokenizer_revision"),
+    "tokenizer pinned apart from its embedder": (_set("chunking", size_tokenizer_revision="0" * 40), "differs from"),
 }
 
 

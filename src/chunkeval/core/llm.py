@@ -371,6 +371,15 @@ class ChatLLM:
         return results  # type: ignore[return-value]   # every slot is filled by now
 
 
+def loaded_ollama_models(base_url: str) -> list[str]:
+    """Models Ollama holds in memory right now — what `ollama ps` lists.
+
+    `base_url` is the OpenAI-compatible URL. Raises `requests.RequestException` when the server
+    is unreachable, so callers decide whether that matters (`embedding.check_gpu_free` doesn't mind).
+    """
+    return list(_loaded_models(_native_url(base_url)))
+
+
 def unload_ollama_model(base_url: str, model: str) -> None:
     """Free the GPU after a local LLM stage, before embedding or switching models.
 

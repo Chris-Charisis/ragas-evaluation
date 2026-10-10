@@ -50,7 +50,7 @@ STAGES: dict[str, Stage] = {
     "chunk": Stage("Stage 2: CanonicalDoc -> chunks for every (method, overlap) + size stats",
                    ("chunkeval.corpus.chunking:run",), ("corpora", "limit")),
     "embed": Stage("Stage 2b: embed chunks with bge-m3 (primary) and Qwen3-Embedding (secondary), cached (GPU)",
-                   ("chunkeval.corpus.embedding:run",)),
+                   ("chunkeval.corpus.embedding:run",), ("corpora", "embedders")),
     "index": Stage("Stage 3: load chunks + both named vectors into the v2 Weaviate collections",
                    ("chunkeval.corpus.indexing:run",), ("corpora", "limit")),
     "gen-qa": Stage("Stage 4: generate Q-A pairs with located evidence spans",
@@ -66,7 +66,7 @@ STAGES: dict[str, Stage] = {
     "report": Stage("Stage 9: tables with bootstrap CIs, paired diffs, breakdowns",
                     ("chunkeval.analysis:run",)),
 }
-# TODO(you), with each stage: --embedder for embed/retrieve, --recreate for index,
+# TODO(you), with each stage: --embedder for retrieve, --recreate for index,
 #   --pilot N / --bridge for eval (ragas_eval.run already takes `pilot` and `bridge`).
 
 
@@ -85,6 +85,9 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
     "limit": lambda p: p.add_argument(
         "--limit", type=_positive_int, metavar="N",
         help="smoke test: only the first N documents per corpus"),
+    "embedders": lambda p: p.add_argument(
+        "--embedder", dest="embedders", action="append", metavar="NAME",
+        help="only this embedder (repeatable); default: embedding.primary, then embedding.secondary"),
 }
 
 
@@ -114,6 +117,12 @@ def stage_options(stage: Stage, args: argparse.Namespace, cfg: Config) -> dict[s
         if unknown:
             raise SystemExit(f"unknown corpus {unknown}; configured: {list(cfg.paths.corpora)}")
         options["corpora"] = corpora
+    if "embedders" in options:
+        embedders = list(dict.fromkeys(options["embedders"] or [cfg.embedding.primary, *cfg.embedding.secondary]))
+        unknown = [e for e in embedders if e not in cfg.embedding.models]
+        if unknown:
+            raise SystemExit(f"unknown embedder {unknown}; configured: {list(cfg.embedding.models)}")
+        options["embedders"] = embedders
     return options
 
 

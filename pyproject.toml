@@ -56,7 +56,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Live tests skip themselves when their service is unavailable. Fast offline run only:
-#   pytest -m "not ollama and not openai"
+#   pytest -m "not ollama and not openai and not gpu"
 markers = [
     "ollama: talks to the local Ollama server and loads models into the GPU (slow)",
     "openai: calls the OpenAI API (free metadata endpoints only, needs OPENAI_API_KEY)",

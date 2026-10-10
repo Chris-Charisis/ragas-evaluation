@@ -3,7 +3,8 @@
 Why token-based sizes: the old chunkers counted words (`split(" ")`), but the embedding model
 counts tokens — and scientific text (numbers, units, species names, acronyms) has a very uneven
 words-to-tokens ratio. Sizes are measured in the PRIMARY embedder's tokenizer (bge-m3, set in
-cfg.chunking.size_tokenizer) so "256 tokens" means the same thing for every method.
+cfg.chunking.size_tokenizer, at the Hub commit cfg.chunking.size_tokenizer_revision) so "256
+tokens" means the same thing for every method, and stays the same if the model repo is updated.
 
 Note: with bge-m3 (8192-token context) the max chunk size is no longer imposed by the model —
 cfg.chunking.max_tokens is now an experimental choice that keeps the size distribution
@@ -62,7 +63,8 @@ def load_chunks(path: str | Path) -> list[Chunk]:
 class TokenCounter:
     """Wraps the size tokenizer (bge-m3 — an XLM-RoBERTa SentencePiece tokenizer).
 
-    - Only the tokenizer is loaded (~20 MB), not the 2 GB model.
+    - Only the tokenizer is loaded (~20 MB), not the 2 GB model, at a pinned Hub commit
+      (`revision`): a newer tokenizer version could move every chunk boundary.
     - Counts WITHOUT special tokens: bge-m3 adds <s> and </s> at encode time, which is irrelevant
       at 8192 but keep it in mind if you ever cap near a limit.
     - XLM-R tokens are not bge-large WordPiece tokens: "256 tokens" is a slightly different amount
@@ -73,11 +75,12 @@ class TokenCounter:
       counts instead of re-tokenising every candidate chunk.
     """
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, revision: str) -> None:
         from transformers import AutoTokenizer      # imported here: slow, and only `chunk` needs it
 
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.revision = revision
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
         if not self.tokenizer.is_fast:
             raise ValueError(f"{model_name}: no fast tokenizer, so no offset mapping (char_offsets)")
 
@@ -101,9 +104,11 @@ class TokenCounter:
 
 
 @functools.cache
-def load_counter(model_name: str) -> TokenCounter:
-    """One TokenCounter per tokenizer and process: the `chunk` stage and the tests share it."""
-    return TokenCounter(model_name)
+def load_counter(model_name: str, revision: str) -> TokenCounter:
+    """One TokenCounter per tokenizer, revision and process: the `chunk` stage and the tests share it.
+    Pass cfg.chunking.size_tokenizer and cfg.chunking.size_tokenizer_revision; the revision has no
+    default, so no stage can measure sizes with an unpinned tokenizer by accident."""
+    return TokenCounter(model_name, revision)
 
 
 class Chunker(ABC):

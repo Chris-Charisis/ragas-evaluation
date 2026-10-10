@@ -58,7 +58,7 @@ def test_stage_targets_accept_the_cli_options(command, cfg):
     for required parameters) — before anyone runs the stage for real.
     """
     stage = cli.STAGES[command]
-    options = {"corpora": ["papers"], "limit": 1}
+    options = {"corpora": ["papers"], "limit": 1, "embedders": ["bge_m3"]}
     for target in stage.targets:
         function = cli.resolve(target)
         inspect.signature(function).bind(cfg, Secrets(), **{o: options[o] for o in stage.options})
@@ -82,7 +82,7 @@ def test_options_only_where_declared():
     args = cli.build_parser().parse_args(["parse", "--corpus", "papers", "--limit", "2", "-v"])
     assert (args.corpora, args.limit, args.verbose) == (["papers"], 2, True)
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["embed", "--corpus", "papers"])     # embed has no --corpus
+        cli.build_parser().parse_args(["report", "--corpus", "papers"])    # report has no --corpus
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "two"])
@@ -105,6 +105,19 @@ def test_unknown_corpus_rejected(cfg):
     args = cli.build_parser().parse_args(["parse", "--corpus", "books"])
     with pytest.raises(SystemExit, match="unknown corpus"):
         cli.stage_options(cli.STAGES["parse"], args, cfg)
+
+
+def test_default_embedders_primary_first(cfg):
+    args = cli.build_parser().parse_args(["embed"])
+    assert cli.stage_options(cli.STAGES["embed"], args, cfg)["embedders"] == [cfg.embedding.primary, *cfg.embedding.secondary]
+    args = cli.build_parser().parse_args(["embed", "--embedder", "qwen3_06b", "--embedder", "qwen3_06b"])
+    assert cli.stage_options(cli.STAGES["embed"], args, cfg)["embedders"] == ["qwen3_06b"]
+
+
+def test_unknown_embedder_rejected(cfg):
+    args = cli.build_parser().parse_args(["embed", "--embedder", "bge-m3"])
+    with pytest.raises(SystemExit, match="unknown embedder"):
+        cli.stage_options(cli.STAGES["embed"], args, cfg)
 
 
 def test_ollama_models_per_stage(cfg):

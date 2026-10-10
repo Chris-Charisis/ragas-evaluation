@@ -39,7 +39,8 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 
 **Options:**
 - **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
-- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`.
+- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed` has `--corpus` only.
+- **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`).
 
 **What the CLI does around every stage,** so stage code doesn't have to:
 1. It validates the config and checks this stage's secrets, so a problem stops the run in the first second.
@@ -94,11 +95,12 @@ src/chunkeval/
 
 1. **Ground truth that doesn't depend on any chunker.** Q-A pairs are generated from paragraph groups of the Docling structure, not from one of the chunkers under test. Each answer must quote its evidence word for word. The quote is located in the canonical text and becomes a **character span**. This allows deterministic retrieval metrics, and any pair whose quote can't be found is dropped, which filters out hallucinated pairs by construction.
 2. **One canonical text per document.** Every chunker and the Q-A generator work on the same string, so all character offsets are comparable.
-3. **Chunk sizes are measured in bge-m3 tokens**, targeting 256 with a cap of 512. The cap is an experimental choice, not a model limit, since bge-m3 reads up to 8192 tokens. 256 tokens is about 160 words on the dev docs, not the previous round's 200; the reason for keeping it is in `configs/default.yaml`. The grid is 3 methods (character / sentence / recursive-chapter) × overlap on/off × 2 corpora, which gives 12 collections.
+3. **Chunk sizes are measured in bge-m3 tokens**, with the tokenizer pinned to the same Hub commit as the bge-m3 embedder (`chunking.size_tokenizer_revision`; the config refuses two different pins). Chunk sizes target 256 tokens with a cap of 512. The cap is an experimental choice, not a model limit, since bge-m3 reads up to 8192 tokens. 256 tokens is about 160 words on the dev docs, not the previous round's 200; the reason for keeping it is in `configs/default.yaml`. The grid is 3 methods (character / sentence / recursive-chapter) × overlap on/off × 2 corpora, which gives 12 collections.
 4. **Two embedders, stored as named vectors in the same 12 collections:**
    - **Primary: `BAAI/bge-m3`.** Used for everything: span metrics, RAG answers, Ragas. It needs no query instruction.
    - **Secondary: `Qwen/Qwen3-Embedding-0.6B`.** Only the free span metrics are computed with it. Its job is to check whether the chunker ranking holds under a different embedder, and whether the embedder or the chunker is the bigger lever. Its queries need an `Instruct: …\nQuery:` prompt (set in the config).
    - Both models produce 1024-dim vectors, so a mix-up never raises an error. Always pass vectors together with their embedder name (see `embedding.py`).
+   - **Both are pinned to a Hub commit** (`revision` in `configs/default.yaml`, a full 40-character hash; a branch like `main` is rejected). Otherwise an upstream push could change the vectors mid-experiment, and queries would be embedded by a different model than the documents. Changing a revision makes `chunkeval embed` re-embed that model's chunk files. The config comment shows how to look up the latest commit.
 5. **Correct Ragas inputs:**
    - `user_input` = question
    - `retrieved_contexts` = top-k chunks
@@ -150,8 +152,9 @@ Both corpora may still be replaced by a different set of documents, so every set
 The tests import `chunkeval` as the installed package, so run `uv sync` once (see [Package layout](#package-layout)). pytest is in the dev dependency group, which `uv sync` installs too.
 
 ```bash
-uv run pytest                                   # everything (~25 s with Ollama running)
-uv run pytest -m "not ollama and not openai"    # offline tests only (~1 s): run after every change
+uv run pytest                                   # everything (~35 s with Ollama running and a free GPU)
+uv run pytest -m "not ollama and not openai and not gpu"   # offline tests only (~5 s): run after every change
+uv run pytest -m gpu                            # embedding models on the GPU (~10 s): run after changing embedding.py or the models
 uv run pytest -m ollama                         # live Ollama tests only: run after upgrading Ollama or changing models
 uv run pytest -m openai                         # OpenAI key + judge snapshots: run before an eval run
 uv run pytest tests/test_store.py -v            # one file, one line per test
@@ -171,12 +174,15 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_cli.py](tests/test_cli.py) | Every stage in `cli.STAGES` points to a `run` that accepts the options the CLI passes. Argument parsing, and what `main` does around a stage: config saved, log file written, exit codes 1 and 130, missing secrets stop the run before any work, and the Ollama check before and unload after an LLM stage, even when it fails. | nothing |
 | [tests/test_llm.py](tests/test_llm.py), marker `openai` | The API key is valid and the pinned judge snapshots still exist. It only calls a free metadata endpoint, so there's **no cost**. | `OPENAI_API_KEY` |
 | [tests/test_chunking.py](tests/test_chunking.py) | The chunk invariants on all 6 configurations: `text == doc.text[start:end]`, full coverage, `max_tokens`, disjoint spans without overlap, the overlap budget. Also sentence boundaries around tricky abbreviations, the recursive section groups, the shared size rules (`pack`, `overlap_start`), each way `validate_chunks` fails, and the `chunk` stage's output files. When `data/parsed/` exists, the 6 configurations also run on the parsed dev docs with the config sizes. | the bge-m3 tokenizer (~20 MB, downloaded on first use) |
-| `test_embedding.py`, `test_quote_locator.py`, … | Placeholders (`pytest.skip("TODO(you)")`) for the modules that aren't written yet. They show as `s`. | — |
+| [tests/test_embedding.py](tests/test_embedding.py), offline | The vector cache and the `embed` stage with a fake embedder. Each model is loaded once and only when a file needs it. A re-run embeds only changed chunk files: the cache compares content hashes, not mtimes, and a changed query prompt doesn't count. A new model revision re-embeds that model's files. A crashed run resumes. The loader refuses vectors whose chunk_ids differ (order included) or whose settings are stale. The Ollama guard names the loaded models and passes when Ollama is unreachable. | nothing |
+| [tests/test_embedding.py](tests/test_embedding.py), marker `gpu` | Both real models: loaded at the pinned revision; float32 unit-norm output; Qwen3's instruction applied to queries only; two different vector spaces; a 3-passage retrieval sanity check; the same vector with and without padding (pooling + padding side); too-long input raises instead of being truncated; every chunk in `data/chunks/` fits each model's `max_seq_length`. | a CUDA GPU with no Ollama model loaded; the models (~4.5 GB bge-m3, ~1.2 GB Qwen3, downloaded on first use) |
+| `test_quote_locator.py`, `test_retrieval_metrics.py` | Placeholders (`pytest.skip("TODO(you)")`) for the modules that aren't written yet. They show as `s`. | — |
 
 **Good to know:**
 - **Live tests skip themselves** when their service isn't available. If Ollama isn't running, `uv run pytest` still passes, and the live tests show as skipped instead of failing.
 - **Tests never touch real data.** The `cfg` fixture points `runs_dir` to a temporary folder, so nothing is written to `runs/` or `data/`.
 - **The `ollama` tests load the models onto the GPU** (about 20 s) and unload them at the end, even when a test fails. Don't run them while embedding is using the GPU.
+- **The `gpu` tests load both embedders once per test module** and unload them at its end, so they're gone before the `ollama` tests run. They skip when there's no CUDA GPU or when Ollama holds a model.
 - **A generator must be 100% on the GPU.** `test_live_check_ollama` fails if `qa_generator` or `rag_generator` is partly offloaded to the CPU. If you switch to one of the MoE generators, which offload by design, relax that assertion.
 - **Writing new tests:**
   - Use the fixtures from `conftest.py`: `cfg` (a validated config) and `raw_config` (the YAML as a dict, for building invalid configs).
@@ -222,7 +228,7 @@ Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
   - tokens per second
 
 **Running notes:**
-- **One model on the GPU at a time.** Before each `embed` run, and between generator and critic stages, unload the loaded model with `ollama stop <model>`. Otherwise Ollama keeps it for 5 minutes, and the next model or the embedders get pushed onto the CPU.
+- **One model on the GPU at a time.** Before each `embed` run, and between generator and critic stages, unload the loaded model with `ollama stop <model>`. Otherwise Ollama keeps it for 5 minutes, and the next model or the embedders get pushed onto the CPU. `embed` checks this itself: before loading each embedder it asks Ollama what is loaded and stops with the `ollama stop` command to run. It never unloads a model itself, because the model may belong to another project.
 - **Check placement with `ollama ps`.** It should show `100% GPU` for the generator.
 - **Turn thinking off for generation.** Qwen and gpt-oss are reasoning models, so set this in `llm.py`. Alternatively use an `-instruct-2507` tag, which never thinks.
 - **Embeddings stay in Python** (sentence-transformers, fp16), not in Ollama. That gives full control over query prompts and pooling, and keeps the vectors free of extra quantization.
