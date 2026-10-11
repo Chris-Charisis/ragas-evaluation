@@ -150,13 +150,18 @@ class LLM(StrictConfig):
     judge: LLMModel
     bridge_judge: LLMModel
 
+# Question types the Q-A generator can be asked for (prompts/qa_generation.md defines each one);
+# also the enum of qa.generation.QA_JSON_SCHEMA.
+QuestionType = Literal["factoid", "numeric", "definition", "reasoning"]
+
+
 class QA(StrictConfig):
     docs_per_corpus: int = Field(gt=0)
     max_questions_per_doc: int = Field(gt=0)
     unit_min_tokens: int = Field(gt=0)
     unit_max_tokens: int = Field(gt=0)
     two_span_ratio: float = Field(ge=0, le=1)
-    question_types: list[Literal["factoid", "numeric", "definition", "reasoning"]] = Field(min_length=1)
+    question_types: list[QuestionType] = Field(min_length=1)
     fuzzy_match_threshold: float = Field(ge=0, le=100)   # rapidfuzz score
     critic_min_score: int = Field(ge=1, le=5)
     dedup_cosine_threshold: float = Field(gt=0, le=1)

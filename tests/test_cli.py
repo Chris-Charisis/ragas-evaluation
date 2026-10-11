@@ -96,10 +96,11 @@ def test_default_corpora_are_all_configured(cfg):
     assert cli.stage_options(cli.STAGES["parse"], args, cfg) == {"corpora": list(cfg.paths.corpora), "limit": None}
 
 
-def test_recreate_is_off_unless_given(cfg):
-    for argv, recreate in ((["index"], False), (["index", "--recreate"], True)):
+@pytest.mark.parametrize("stage", ["index", "gen-qa"])
+def test_recreate_is_off_unless_given(cfg, stage):
+    for argv, recreate in (([stage], False), ([stage, "--recreate"], True)):
         args = cli.build_parser().parse_args(argv)
-        assert cli.stage_options(cli.STAGES["index"], args, cfg)["recreate"] is recreate
+        assert cli.stage_options(cli.STAGES[stage], args, cfg)["recreate"] is recreate
 
 
 def test_repeated_corpus_deduplicated_in_order(cfg):
@@ -189,7 +190,7 @@ def test_main_missing_secret_stops_before_any_work(config_file, calls, monkeypat
 def test_main_llm_stage_preflight_and_unload(config_file, calls, ollama):
     cli.main(["gen-qa", "--config", str(config_file), "--corpus", "papers"])
     assert ollama[0][0] == "check"                           # preflight before the stage
-    assert calls and calls[0]["options"] == {"corpora": ["papers"], "limit": None}
+    assert calls and calls[0]["options"] == {"corpora": ["papers"], "limit": None, "recreate": False}
     assert ollama[-1][0] == "unload"                         # GPU freed after it
 
 

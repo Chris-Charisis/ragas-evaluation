@@ -16,7 +16,7 @@ The package is a **scaffold**. Each module has docstrings, signatures and `TODO(
 | 2 | `chunk` | `corpus/chunking/*` | CanonicalDoc → `data/chunks/<corpus>/<method>_<ovl>.jsonl` + size stats |
 | 2b | `embed` | `corpus/embedding.py` | chunks → cached vectors `data/embeddings/<embedder>/…` (bge-m3 + Qwen3, GPU) |
 | 3 | `index` | `corpus/indexing.py` | chunks + both vectors → Weaviate `{corpus}_{method}_{ovl}_v2` (named vectors) |
-| 4 | `gen-qa` | `qa/generation.py` | CanonicalDoc → `data/qa/raw.jsonl` (with evidence char spans) |
+| 4 | `gen-qa` | `qa/generation.py` | CanonicalDoc → `data/qa/raw.jsonl` (with evidence char spans) + `gen_dropped.jsonl` (with reasons) |
 | 5 | `filter-qa` | `qa/filtering.py` | raw → `data/qa/filtered.jsonl` (+ `rejected.jsonl` with reasons) |
 | 6 | `retrieve` | `evaluation/retrieval.py` + `evaluation/retrieval_metrics.py` | questions × 12 collections × 2 embedders → `runs/<id>/retrieval/<embedder>/*.jsonl` + span metrics |
 | 7 | `answer` | `evaluation/answering.py` | retrieved contexts → RAG responses |
@@ -41,7 +41,7 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 - **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
 - **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed` has `--corpus` only.
 - **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`).
-- **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [What `index` builds](#what-index-builds)).
+- **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [What `index` builds](#what-index-builds)). On `gen-qa`: delete every Q-A record, of all corpora, and generate again (see [Q-A generation](#q-a-generation-gen-qa)).
 
 **What the CLI does around every stage,** so stage code doesn't have to:
 1. It validates the config and checks this stage's secrets, so a problem stops the run in the first second.
@@ -139,7 +139,8 @@ Both corpora may still be replaced by a different set of documents, so every set
 - **Reports' drop list:** `parsing.body.reports.drop_titles` was built from two AfricaRice annual reports. Extend it from the full corpus (candidates are noted in the config).
 - **Garbled OCR text (seen in paper_4).** paper_4 is converted with full-page OCR because its text layer is duplicated (`repeated_paragraph_ratio` 0.12). In 7 paragraphs of sections 2, 3.1, 3.2 and 4.1, the OCR output is nonsense, e.g. "The GanbanlPlatondastenegtls initiadedbovemgonicatienebaitks…". That is about 2,100 of its 16,700 tokens (13%). report_16, also OCR'd (for unreadable fonts), came out clean.
   - **Why it matters:** garbled chunks get indexed and compete in retrieval as noise. A Q-A unit drawn from them gives nonsense questions, and since the quote locator matches verbatim text, it can still "locate" a garbled quote. It also distorts the size stats (one garbled "sentence" alone is 529 tokens).
-  - **Detecting it:** tokens per word is a good first signal: 3.4–17 in the garbled paragraphs vs. about 1.6 in normal text. But email contact lines in the reports also reach 3–4.5, so a second signal is needed, e.g. the share of words found in an English word list. Calibrate it on the full corpus.
+  - **A second kind, inside clean paragraphs:** paper_4 also has fragments of single letters mixed into otherwise normal paragraphs, e.g. "…potentially unique ar s s o e e o es ,sers s u ton Cryopreserved back-up collections…" or a paragraph opening "a re rs h n nd h- nae rnd s s u uun…". Their tokens per word is normal (1.36), and at block level neither tokens per word nor mean word length separates them from clean text (4.64 letters per word vs. 3.52 for a clean formula paragraph in paper_8). `sample_units` picked one such paragraph on the dev docs; the generation prompt tells the model to skip garbled text, and the critic sees the passage.
+  - **Detecting it:** tokens per word is a good first signal: 3.4–17 in the garbled paragraphs vs. about 1.6 in normal text. But email contact lines in the reports also reach 3–4.5, so a second signal is needed, e.g. the share of words found in an English word list. That share would also catch the letter fragments, if measured per sentence rather than per block. Calibrate it on the full corpus. Every generation unit stores its `tokens_per_word` in `meta`. `sample_units` already drops a single "sentence" longer than `unit_max_tokens`: on the dev docs only two, both garbled in paper_4 (529 and 401 tokens). The rest of the 669-token garbled paragraph splits into normal-sized sentences, which can still end up in a unit.
   - **Options:** (a) measure it as a third `meta.text_layer` ratio and flag or drop garbled blocks; (b) retry OCR with another engine or a higher image resolution; (c) OCR only the pages with the duplicated layer and keep the text layer elsewhere; (d) exclude the document. Choose once you know how many documents of the final corpus are affected.
 
 **Chunking** (the numbers are in `data/chunks/<corpus>/_size_stats.json`)
@@ -147,6 +148,11 @@ Both corpora may still be replaced by a different set of documents, so every set
 - **Small recursive chunks on reports:** on the dev docs, recursive chunks average 192 tokens (vs. 256 for the other methods), and 5% are 40 tokens or less. Reports have many tiny sections (office addresses, "ISBN:", "Writing:"). Check how common small chunks are on the full corpus. The setting is `chunking.min_section_tokens`, which merges small sibling sections under the same parent only. Raising it trades section purity for size.
 - **Character window:** it is calibrated per corpus on every run (1,073 chars for papers and 1,101 for reports on the dev docs). Check that the two values stay close, and that the chunk log has no "window … > max_tokens" warnings.
 - **Sentence overlap:** it averages 42–47 tokens vs. 31 for the character windows, because it repeats at least one whole sentence. That rule is deliberate (the docx suggests a 1-sentence overlap). Report the measured `overlap_tokens_mean` next to the results.
+
+**Q-A generation** (check after `gen-qa` has run on the full corpus)
+- **Two-span units across a section boundary.** On the dev docs the model skipped all 4 it was given (0 Q-A pairs), calling the two paragraphs unrelated; same-section pairs gave 3 of 4. They stay in the pool for now (decided 2026-10-11): they are the hard case for the recursive chunker, which never crosses a section.
+  - **Where to look:** the `gen-qa` summary (log and `runs/<run_id>/gen_qa_summary.json`) gives two-span pairs/units per corpus, within one section and across sections.
+  - **If they keep failing:** restrict two-span units to pairs within one section (`sample_units`). Every failed one costs its document a unit, because skipped two-span units are not retried.
 
 ## Testing
 
@@ -180,7 +186,9 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_embedding.py](tests/test_embedding.py), marker `gpu` | Both real models: loaded at the pinned revision; float32 unit-norm output; Qwen3's instruction applied to queries only; two different vector spaces; a 3-passage retrieval sanity check; the same vector with and without padding (pooling + padding side); too-long input raises instead of being truncated; every chunk in `data/chunks/` fits each model's `max_seq_length`. | a CUDA GPU with no Ollama model loaded; the models (~4.5 GB bge-m3, ~1.2 GB Qwen3, downloaded on first use) |
 | [tests/test_indexing.py](tests/test_indexing.py), offline | Every chunk field but `meta` is a property, and only `text` is searchable. `--limit` takes the first documents by doc_id, with their own vectors. Missing chunks or vectors name the stage to run. Provenance changes with the chunks, the embedder settings and `--limit`. | nothing |
 | [tests/test_indexing.py](tests/test_indexing.py), marker `weaviate` | On 6 fake chunks with hash vectors: the collection gets both named vectors (flat, cosine) and its provenance, and every object matches its chunk and cached vectors. A chunk's vector finds that chunk first in its own space. doc_id filters match whole ids, and BM25 ignores section titles. A re-run skips an up-to-date collection and refuses a stale, incomplete or hand-made one until `--recreate`. Verification catches swapped names and shifted rows, and failed inserts raise. | Weaviate running (`docker compose up -d`), `WEAVIATE_API_KEY`; touches only `*_pytest` collections |
-| `test_quote_locator.py`, `test_retrieval_metrics.py` | Placeholders (`pytest.skip("TODO(you)")`) for the modules that aren't written yet. They show as `s`. | — |
+| [tests/test_generation.py](tests/test_generation.py) | Unit sampling on `tiny_doc` with small sizes: single units stay in one section and within the size bounds; sections that are too small get no unit; a paragraph over the max is cut into sentence groups; an over-long sentence is in no unit; two-span units are adjacent whole paragraphs (also across a section boundary); skippable sections are never used; the per-doc cap and the two-span ratio hold, and no two units overlap. The prompt file has exactly its sections and placeholders, checked on load: a missing section, a misspelt placeholder or a lone `$` fails. The chat messages: one system message shared by every call, then the title, section path, passage and question type in the user message, with passages A and B for a two-span unit. Which outputs `QA_JSON_SCHEMA` accepts (pairs, skips) and rejects, and that its question types are the config's. The generation loop against a fake LLM: pairs with located evidence, every drop reason, a two-span answer quoting one passage only, the factoid retry (single units only), the type rotation. The `gen-qa` stage: resume after a crash asks only the missing unit; drops are saved but API errors aren't (and the stage fails); other settings, another prompt, a re-parsed document or records without provenance are refused until `--recreate`. When `data/parsed/` exists, the same unit invariants on the dev docs with the config sizes: full quota, spread over the document, reproducible by seed. | the bge-m3 tokenizer |
+| [tests/test_quote_locator.py](tests/test_quote_locator.py) | `locate_quote`, the source of every evidence span. Exact matches, and normalized ones whose offsets still point into the original text: whitespace and paragraph breaks, typographic dashes and quotes, soft hyphens, case, an added full stop, line-break hyphenation. Fuzzy matches only above the threshold, widened to whole words, never against a span shorter than the quote. Only the unit's spans are searched, and too-short quotes are rejected. When `data/parsed/` exists, a random quote from every block of the dev docs, verbatim and with that drift. | nothing |
+| `test_retrieval_metrics.py` | Placeholders (`pytest.skip("TODO(you)")`) for the module that isn't written yet. They show as `s`. | — |
 
 **Good to know:**
 - **Live tests skip themselves** when their service isn't available. If Ollama isn't running, `uv run pytest` still passes, and the live tests show as skipped instead of failing.
@@ -359,6 +367,52 @@ uv run chunkeval index --recreate                   # all 12 collections, replac
 | Query error about a missing or unknown vector | `target_vector` must be `bge_m3` or `qwen3_06b`, matching the names in the config |
 | 401 errors | The key in `.env` doesn't match the one the container started with. Restart the container after changing `.env`. |
 | `port is already allocated` | Another Weaviate is running. Check with `docker ps`. |
+
+## Q-A generation (`gen-qa`)
+
+```bash
+uv run chunkeval gen-qa --corpus papers --limit 1   # smoke test: one paper, ~20 s after the ~25 s Ollama preflight
+uv run chunkeval gen-qa                             # every corpus; resumes where an earlier run stopped
+uv run chunkeval gen-qa --recreate                  # delete ALL Q-A records (every corpus) and start over
+```
+
+**What it does,** per document (`qa/generation.py`):
+- **Units** (`sample_units`): up to `qa.max_questions_per_doc`, spread over the whole document, of which `two_span_ratio` are two-span. No two units overlap.
+  - A **single** unit is consecutive paragraphs of one section, packed towards the middle of `unit_min_tokens..unit_max_tokens`.
+  - A **two-span** unit is two adjacent whole paragraphs, also across a section boundary; the question must need both.
+  - A paragraph over the max is cut into sentence groups. A single "sentence" over the max is never used (garbled OCR in practice).
+  - Sections that `skip_section_titles` names, or with less text than the minimum, give no unit.
+- **One question per call,** with the prompt in [prompts/qa_generation.md](prompts/qa_generation.md); its notes explain the file format.
+  - Question types rotate per document. `numeric` passes to the next type for a unit without a digit.
+  - A single unit's skip of another type is asked once more as `factoid`; a two-span skip is final.
+- **Evidence** (`locate_quote`): each quote is searched only inside the unit, first exactly, then normalized, then fuzzy at `qa.fuzzy_match_threshold`. A pair needs every quote located, and in a two-span unit at least one quote in each passage.
+
+**What it writes.** One line per unit, appended as soon as the unit's outcome is final, so a crash loses only the units in flight:
+- **`data/qa/raw.jsonl`:** one `QAPair` per line. `question_type` is the type the model labelled; `meta` holds the types asked, the unit's spans, section path, size and `tokens_per_word`, and the token usage.
+- **`data/qa/gen_dropped.jsonl`:** one `DroppedUnit` per line, with a `reason` (`skip`, `bad_output`, `quote_not_found`, `two_span_one_side`) and the model's output, so the drop rate per corpus and reason can be reported.
+- **API errors are not saved** (timeouts, server down). The stage fails at the end, and a re-run asks exactly those units again.
+- **Summary:** logged and written to `runs/<run_id>/gen_qa_summary.json`. Per corpus: units, pairs, pair rate, drops by reason, how the evidence was located, and the question types.
+
+**Resume and provenance.** `data/qa/raw.provenance.json` records what decides a unit's outcome:
+- the generator (model, settings, Ollama digest), the prompt file's hash, the seed, the size tokenizer, `skip_section_titles`, the `qa` settings that shape units, and `GENERATION_VERSION` (bumped when the code changes its output);
+- a text hash of every document that has records.
+
+On a re-run:
+- with the same values, only units that are in neither file are asked;
+- with any difference, the run is refused and the differing keys are named. `--recreate` deletes the records of every corpus, because the settings are shared.
+
+`qa.docs_per_corpus` and `--limit` only choose which documents are used, so the full run resumes a `--limit` smoke test.
+
+**On the dev docs** (`qwen3.5:9b-q8_0`; 36 hand-made units, plus the paper_4 smoke run):
+- **Output format:** valid JSON every time, never in code fences. Every quote was located, almost all exactly.
+- **Speed:** 56–64 tokens/s at concurrency 2, so about 20 s per document of 10 units, or about 1 h for 200 documents.
+- **Skips:**
+  - `numeric` asked of passages whose only digits are years or names like "F2";
+  - two-span pairs across a section boundary (0 of 4 gave a pair: the model calls them unrelated; `meta.crosses_section` lets the pilot measure this);
+  - garbled OCR text, correctly.
+- **Left to `filter-qa`:** some questions still refer to the source ("according to the passage", "the researchers") or are vague.
+
+**For the generator pilot** (step 5 of the implementation order): run each candidate with `--recreate` on the same documents, then compare `pair_rate`, the drop reasons and tokens/s from the summary, plus the critic's acceptance once `filter-qa` exists. To get about 50 units from the 4 dev docs, raise `qa.max_questions_per_doc` to 13 in a copy of the config.
 
 ## Dependencies
 - **Installed with uv:** all the pipeline libraries, plus pytest in the dev group, plus `chunkeval` itself in editable mode.

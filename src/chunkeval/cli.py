@@ -54,7 +54,7 @@ STAGES: dict[str, Stage] = {
     "index": Stage("Stage 3: load chunks + both named vectors into the v2 Weaviate collections",
                    ("chunkeval.corpus.indexing:run",), ("corpora", "limit", "recreate")),
     "gen-qa": Stage("Stage 4: generate Q-A pairs with located evidence spans",
-                    ("chunkeval.qa.generation:run",), ("corpora", "limit")),
+                    ("chunkeval.qa.generation:run",), ("corpora", "limit", "recreate")),
     "filter-qa": Stage("Stage 5: deterministic checks + critic + dedup + final sample",
                        ("chunkeval.qa.filtering:run",)),
     "retrieve": Stage("Stage 6: top-k retrieval per question, collection and embedder + span metrics",
@@ -90,7 +90,8 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
         help="only this embedder (repeatable); default: embedding.primary, then embedding.secondary"),
     "recreate": lambda p: p.add_argument(
         "--recreate", action="store_true",
-        help="delete and rebuild collections that already exist; default: skip up-to-date ones, refuse stale ones"),
+        help="delete what this stage built before and build it again; default: reuse what is up to "
+             "date, refuse what is stale (index: the selected collections; gen-qa: all Q-A records)"),
 }
 
 

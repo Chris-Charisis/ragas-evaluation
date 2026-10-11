@@ -371,6 +371,22 @@ class ChatLLM:
         return results  # type: ignore[return-value]   # every slot is filled by now
 
 
+def ollama_model_digest(base_url: str, model: str) -> str:
+    """Digest of a pulled model (`GET /api/tags`), for the provenance of what a model made: a tag
+    can be re-pushed with new weights, the digest pins the exact file.
+
+    `base_url` is the OpenAI-compatible URL. Raises `requests.RequestException` when the server is
+    unreachable and RuntimeError when the model isn't pulled.
+    """
+    r = requests.get(f"{_native_url(base_url)}/api/tags", timeout=10)
+    r.raise_for_status()
+    pulled = {m["name"]: m["digest"] for m in r.json()["models"]}
+    tag = _ollama_tag(model)
+    if tag not in pulled:
+        raise RuntimeError(f"Ollama model {tag} is not pulled (ollama pull {tag})")
+    return pulled[tag]
+
+
 def loaded_ollama_models(base_url: str) -> list[str]:
     """Models Ollama holds in memory right now — what `ollama ps` lists.
 
