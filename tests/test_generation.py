@@ -4,6 +4,7 @@ The quote locator has its own file, test_quote_locator.py.
 """
 import json
 import re
+from dataclasses import asdict
 from typing import get_args
 
 import jsonschema
@@ -13,12 +14,12 @@ import pytest
 from chunkeval.core.llm import LLMOutputError, LLMResult
 from chunkeval.core.schema import QA as QAConfig
 from chunkeval.core.schema import REPO_ROOT
-from chunkeval.core.store import read_jsonl, run_dir, write_json
+from chunkeval.core.store import read_jsonl, run_dir, write_json, write_jsonl
 from chunkeval.corpus.parsing import is_skippable_section, load_doc
 from chunkeval.qa import generation
-from chunkeval.qa.generation import (PROMPT_PATH, QA_JSON_SCHEMA, QUESTION_TYPES, DroppedUnit,
+from chunkeval.qa.generation import (PROMPT_PATH, QA_JSON_SCHEMA, QUESTION_TYPES, DroppedUnit, EvidenceSpan,
                                      GenerationUnit, QAPair, assign_types, build_messages,
-                                     generate_for_doc, load_prompt, qa_paths, run, sample_units)
+                                     generate_for_doc, load_pairs, load_prompt, qa_paths, run, sample_units)
 
 
 def block_span(doc, startswith):
@@ -124,18 +125,22 @@ PARSED = sorted((REPO_ROOT / "data" / "parsed").glob("*/*.json"))
 
 
 @pytest.mark.skipif(not PARSED, reason="no parsed docs in data/parsed: run `chunkeval parse` first")
-def test_units_parsed_docs(cfg):
-    """The config sizes on the dev docs: every invariant, the full quota (they have plenty of
-    candidates), spread over the document rather than the first N, and reproducible by seed."""
+def test_units_parsed_docs(cfg, counter):
+    """The config sizes on the dev docs: every invariant, and reproducible by seed. A document with
+    at least quota x unit_max_tokens of running text fills the quota, spread over the whole
+    document rather than the first N (paper_42, ~1,900 tokens, gives 6 units, which fill it)."""
+    quota = cfg.qa.max_questions_per_doc
     differs = False
     for path in PARSED:
         doc = load_doc(path)
         units = sample_units(doc, cfg, np.random.default_rng(42))
         check_units(doc, cfg, units)
-        assert len(units) == cfg.qa.max_questions_per_doc
-        assert sum(u.kind == "two_span" for u in units) == round(cfg.qa.max_questions_per_doc * cfg.qa.two_span_ratio)
-        starts = [u.spans[0][0] / len(doc.text) for u in units]
-        assert min(starts) < 0.2 and max(starts) > 0.8, (path.stem, starts)
+        body_tokens = sum(counter.count_many([doc.text[b.start:b.end] for b in doc.blocks if b.type != "heading"]))
+        if body_tokens >= quota * cfg.qa.unit_max_tokens:
+            assert len(units) == quota, path.stem
+            assert sum(u.kind == "two_span" for u in units) == round(quota * cfg.qa.two_span_ratio)
+            starts = [u.spans[0][0] / len(doc.text) for u in units]
+            assert min(starts) < 0.2 and max(starts) > 0.8, (path.stem, starts)
         assert units == sample_units(doc, cfg, np.random.default_rng(42))
         differs |= units != sample_units(doc, cfg, np.random.default_rng(43))
     assert differs
@@ -327,6 +332,17 @@ def test_generate_pairs(tiny_doc, small_cfg):
         assert pair.meta["requested_types"] == [pair.question_type]
         assert pair.meta["unit_spans"] == unit.spans and pair.meta["n_tokens"] == unit.meta["n_tokens"]
         assert (pair.meta["prompt_tokens"], pair.meta["completion_tokens"]) == (100, 20)
+
+
+def test_load_pairs_round_trip(tiny_doc, small_cfg, tmp_path):
+    """What gen-qa writes, load_pairs reads back as the same QAPairs, evidence as EvidenceSpans
+    (meta["unit_spans"] as lists: JSON has no tuples)."""
+    outcomes, _ = generate(tiny_doc, small_cfg)
+    path = tmp_path / "raw.jsonl"
+    write_jsonl(path, outcomes)
+    loaded = load_pairs(path)
+    assert all(isinstance(ev, EvidenceSpan) for qa in loaded for ev in qa.evidence)
+    assert [asdict(qa) for qa in loaded] == [json.loads(json.dumps(asdict(qa))) for qa in outcomes]
 
 
 def test_generate_skips_done_units(tiny_doc, small_cfg):

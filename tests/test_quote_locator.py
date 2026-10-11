@@ -6,7 +6,7 @@ import pytest
 
 from chunkeval.core.schema import REPO_ROOT
 from chunkeval.corpus.parsing import SEPARATOR, load_doc
-from chunkeval.qa.generation import _QUOTE_EDGES, MIN_QUOTE_WORDS, locate_quote
+from chunkeval.qa.generation import _INVISIBLE, _QUOTE_EDGES, MIN_QUOTE_WORDS, locate_quote
 
 THRESHOLD = 90   # cfg.qa.fuzzy_match_threshold
 
@@ -129,8 +129,10 @@ def test_parsed_docs():
     """One random word-aligned quote from every block of the parsed dev docs. Verbatim, it matches
     exactly. With the drift a model adds (ASCII dashes and quotes, soft hyphens dropped, first
     letter capitalised, a full stop added) it matches normalized, at the same span minus the
-    stripped edge punctuation. Real Docling text, so a character that breaks the offset map of
+    stripped edge punctuation and invisible characters (paper_74 has a quote ending in a soft
+    hyphen, "coun\\xad"). Real Docling text, so a character that breaks the offset map of
     `_normalize` shows up here."""
+    edges = _QUOTE_EDGES + "".join(_INVISIBLE)
     rng = random.Random(0)
     for path in PARSED:
         doc = load_doc(path)
@@ -140,8 +142,10 @@ def test_parsed_docs():
                 continue
             i = rng.randrange(len(words) - MIN_QUOTE_WORDS + 1)
             j = rng.randrange(i + MIN_QUOTE_WORDS, min(len(words), i + 30) + 1)
-            start, end = block.start + words[i][0], block.start + words[j - 1][1]
-            quote = doc.text[start:end]
+            quote = doc.text[block.start + words[i][0]:block.start + words[j - 1][1]]
+            # The first occurrence in the block: a short quote can occur twice (report_123).
+            start = doc.text.find(quote, block.start, block.end)
+            end = start + len(quote)
             unit = [(block.start, block.end)]
 
             ev = locate_quote(quote, doc.text, unit, THRESHOLD)
@@ -149,6 +153,6 @@ def test_parsed_docs():
 
             drifted = quote.translate(ASCII).replace("­", "")
             ev = locate_quote(drifted[0].upper() + drifted[1:] + ".", doc.text, unit, THRESHOLD)
-            lead = len(quote) - len(quote.lstrip(_QUOTE_EDGES))
-            trail = len(quote) - len(quote.rstrip(_QUOTE_EDGES))
+            lead = len(quote) - len(quote.lstrip(edges))
+            trail = len(quote) - len(quote.rstrip(edges))
             assert (ev.match, ev.start, ev.end) == ("normalized", start + lead, end - trail), (path.stem, quote)

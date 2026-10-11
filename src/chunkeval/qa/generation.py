@@ -42,6 +42,7 @@ from rapidfuzz import fuzz
 
 from chunkeval.core.config import Secrets
 from chunkeval.core.llm import ChatLLM, LLMOutputError, LLMResult, ollama_model_digest
+from chunkeval.core.prompts import load_sections
 from chunkeval.core.schema import REPO_ROOT, Config, QuestionType
 from chunkeval.core.store import append_jsonl, done_ids, read_jsonl, run_dir, write_json
 from chunkeval.corpus.chunking.base import load_counter, pack
@@ -156,7 +157,6 @@ PROMPT_SECTIONS: dict[str, set[str] | None] = {
     "passage": {"label", "section_path", "text"},
     "two_span": set(),
 }
-_SECTION_LINE = re.compile(r"^## ([a-z_]+)[ \t]*$", re.MULTILINE)
 
 
 # Block types a unit is made of: running text. Headings are context (the section path in the
@@ -280,33 +280,25 @@ def sample_units(doc: "CanonicalDoc", cfg: Config, rng: np.random.Generator) -> 
 
 @functools.cache
 def load_prompt(path: Path = PROMPT_PATH) -> dict[str, str]:
-    """The `## <name>` sections of a prompt file, by name; the notes above the first are dropped.
-
-    Read from the file, so the prompt can be changed without touching code (once per process).
-    Checked here, so a typo fails before any LLM call instead of producing odd prompts: exactly
-    the sections of PROMPT_SECTIONS, each using exactly its placeholders.
-    """
-    parts = _SECTION_LINE.split(path.read_text(encoding="utf-8"))
-    names, bodies = parts[1::2], [body.strip() for body in parts[2::2]]
-    if sorted(names) != sorted(PROMPT_SECTIONS):
-        raise ValueError(f"{path}: sections must be {sorted(PROMPT_SECTIONS)}, found {names}")
-    sections = dict(zip(names, bodies))
-    for name, expected in PROMPT_SECTIONS.items():
-        if expected is None:
-            continue
-        template = Template(sections[name])
-        if not template.is_valid():
-            raise ValueError(f"{path}: section {name!r} has a bad placeholder (a literal $ is written $$)")
-        if set(template.get_identifiers()) != expected:
-            raise ValueError(f"{path}: section {name!r} must use the placeholders {sorted(expected)}, "
-                             f"found {sorted(template.get_identifiers())}")
-    return sections
+    """The sections of the generation prompt file, by name (read once per process); exactly those
+    of PROMPT_SECTIONS, each using exactly its placeholders (see `prompts.load_sections`)."""
+    return load_sections(path, PROMPT_SECTIONS)
 
 
 def section_path_at(doc: "CanonicalDoc", offset: int) -> list[str]:
     """Heading path of the section holding the block that starts at or before `offset`."""
     block = doc.blocks[bisect.bisect_right([b.start for b in doc.blocks], offset) - 1]
     return next(s.path for s in doc.sections if s.id == block.section_id)
+
+
+def render_passages(doc: "CanonicalDoc", spans: list[tuple[int, int]], template: str) -> str:
+    """The spans of a unit, each rendered with a prompt's `passage` template ($label, $section_path,
+    $text): labelled A, B, ... when there are several, each with its own section path."""
+    labels = [""] if len(spans) == 1 else [f" {chr(ord('A') + i)}" for i in range(len(spans))]
+    return "\n".join(
+        Template(template).substitute(label=label, section_path=" > ".join(section_path_at(doc, start)),
+                                      text=doc.text[start:end])
+        for label, (start, end) in zip(labels, spans))
 
 
 def build_messages(doc: "CanonicalDoc", unit: GenerationUnit, question_type: str) -> list[dict[str, str]]:
@@ -320,13 +312,8 @@ def build_messages(doc: "CanonicalDoc", unit: GenerationUnit, question_type: str
     if question_type not in QUESTION_TYPES:
         raise ValueError(f"unknown question type {question_type!r}; known: {QUESTION_TYPES}")
     prompt = load_prompt()
-    labels = [""] if len(unit.spans) == 1 else [f" {chr(ord('A') + i)}" for i in range(len(unit.spans))]
-    passages = "\n".join(
-        Template(prompt["passage"]).substitute(
-            label=label, section_path=" > ".join(section_path_at(doc, start)), text=doc.text[start:end])
-        for label, (start, end) in zip(labels, unit.spans))
     user = Template(prompt["user"]).substitute(
-        doc_title=doc.title, passages=passages, question_type=question_type,
+        doc_title=doc.title, passages=render_passages(doc, unit.spans, prompt["passage"]), question_type=question_type,
         two_span=Template(prompt["two_span"]).substitute() if unit.kind == "two_span" else "")
     return [{"role": "system", "content": prompt["system"]},
             {"role": "user", "content": user.strip()}]
@@ -576,6 +563,17 @@ def qa_paths(cfg: Config) -> dict[str, Path]:
             "provenance": qa_dir / "raw.provenance.json"}
 
 
+def pair_from_record(record: dict[str, Any]) -> QAPair:
+    """A QAPair back from its JSONL record (raw.jsonl, filtered.jsonl), evidence included. JSON has
+    no tuples, so meta["unit_spans"] comes back as lists."""
+    return QAPair(**{**record, "evidence": [EvidenceSpan(**ev) for ev in record["evidence"]]})
+
+
+def load_pairs(path: Path) -> list[QAPair]:
+    """Every QAPair of a JSONL file, in file order."""
+    return [pair_from_record(r) for r in read_jsonl(path)]
+
+
 def provenance(cfg: Config, digest: str | None) -> dict[str, Any]:
     """Everything that decides what a unit gives: compared on every re-run, so a resumed run never
     mixes two generators, prompts or unit rules in one file. `digest`: the generator's Ollama
@@ -611,7 +609,7 @@ def select_docs(cfg: Config, corpus: str, limit: int | None) -> list["CanonicalD
     return [load_doc(p) for p in paths]
 
 
-def _text_sha256(doc: "CanonicalDoc") -> str:
+def text_sha256(doc: "CanonicalDoc") -> str:
     return hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
 
 
@@ -642,7 +640,7 @@ def check_provenance(paths: dict[str, Path], settings: dict[str, Any], docs: lis
         differs = [key for key in settings if stored["settings"].get(key) != settings[key]]
         raise fail(f"records made with other settings ({', '.join(differs)} differ)")
     hashes: dict[str, str] = stored["docs"]
-    changed = [f"{d.corpus}/{d.doc_id}" for d in docs if hashes.get(f"{d.corpus}/{d.doc_id}", _text_sha256(d)) != _text_sha256(d)]
+    changed = [f"{d.corpus}/{d.doc_id}" for d in docs if hashes.get(f"{d.corpus}/{d.doc_id}", text_sha256(d)) != text_sha256(d)]
     if changed:
         raise fail(f"documents re-parsed since their Q-A pairs were made: {', '.join(changed)}")
     return hashes
@@ -723,7 +721,7 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
         for i, doc in enumerate(corpus_docs, start=1):
             # Recorded before the first record of the doc, so a crash mid-doc can't leave records
             # whose doc text is unknown to the next run's check.
-            hashes[f"{corpus}/{doc.doc_id}"] = _text_sha256(doc)
+            hashes[f"{corpus}/{doc.doc_id}"] = text_sha256(doc)
             write_json(paths["provenance"], {"settings": settings, "docs": hashes})
             rng = np.random.default_rng([cfg.seed, zlib.crc32(doc.doc_id.encode())])
             outcomes = generate_for_doc(doc, llm, cfg, rng, done, on_outcome=save)
