@@ -7,7 +7,7 @@ File format (see prompts/qa_generation.md for a full example): everything above 
 `## <name>` line is notes and is never sent; each section runs until the next one. Template
 sections use `string.Template` placeholders ($name); a literal dollar sign is written `$$` there.
 
-Used by: qa/generation.py, qa/filtering.py (later evaluation/answering.py).
+Used by: qa/generation.py, qa/filtering.py, evaluation/answering.py.
 """
 from __future__ import annotations
 

@@ -19,7 +19,7 @@ The package is a **scaffold**. Each module has docstrings, signatures and `TODO(
 | 4 | `gen-qa` | `qa/generation.py` | CanonicalDoc → `data/qa/raw.jsonl` (with evidence char spans) + `gen_dropped.jsonl` (with reasons) |
 | 5 | `filter-qa` | `qa/filtering.py` | raw → `data/qa/filtered.jsonl` (+ `rejected.jsonl` with reasons, `critic_scores.jsonl` cache) |
 | 6 | `retrieve` | `evaluation/retrieval.py` + `evaluation/retrieval_metrics.py` | questions × 12 collections × (2 embedders + oracle + random) → `runs/<id>/retrieval/<retriever>/*.jsonl` + `runs/<id>/metrics/retrieval_per_question.parquet` |
-| 7 | `answer` | `evaluation/answering.py` | retrieved contexts → RAG responses |
+| 7 | `answer` | `evaluation/answering.py` + `prompts/rag_answer.md` | questions × 6 setups per corpus (bge-m3's top `top_k` chunks) + the gold passage → `runs/<id>/answers/<corpus>_<setup>.jsonl` (+ `answer_cache.jsonl`) |
 | 8 | `eval` | `evaluation/ragas_eval.py` | samples → per-question Ragas scores |
 | 9 | `report` | `analysis.py` | all per-question scores → tables with bootstrap CIs and paired diffs |
 
@@ -39,7 +39,7 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 
 **Options:**
 - **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
-- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed` and `retrieve` have `--corpus` only.
+- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed`, `retrieve` and `answer` have `--corpus` only.
 - **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`) and on `retrieve` (default: `retrieval.embedders`).
 - **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [What `index` builds](#what-index-builds)). On `gen-qa`: delete every Q-A record, of all corpora, and generate again (see [Q-A generation](#q-a-generation-gen-qa)).
 
@@ -197,6 +197,7 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_retrieval_metrics.py](tests/test_retrieval_metrics.py) | Every span metric on hand-computed toy cases: interval merging and overlap; a hit equal to the evidence scores 1 everywhere; the same offsets in another document score 0; overlapping hits and other documents' text count once in precision and IoU; `all_evidence` needs every quote touched (touching quotes are one); MRR and hit only see the top k; `budget_k` never returns 0. | nothing |
 | [tests/test_retrieval.py](tests/test_retrieval.py), offline | The oracle's greedy cover (hand-computed) and the random baseline's seeding. Query vectors: encoded with the query prompt, cached, encoded again after a new question or prompt. The `retrieve` stage against a fake embedder and retriever: a file per retriever with ranked hits and no text, then the metrics table (one row per question, retriever and k, unique). A re-run asks nothing; a new query prompt redoes only that embedder; a new question set redoes everything; a mode switch is refused; a question's document without chunks, or chunks cut from another parse, stop the stage. The metrics leave out stale files outside the run's scope, with a warning, and fail on stale files inside it. | nothing |
 | [tests/test_retrieval.py](tests/test_retrieval.py), marker `weaviate` | `WeaviateRetriever` on a `*_pytest` collection: a chunk's own vector finds it first with cosine 1, in the named vector asked; an unknown vector name fails; hybrid with alpha 0 is BM25; a collection built from other chunks, or a missing one, is refused. | Weaviate running, `WEAVIATE_API_KEY` |
+| [tests/test_answering.py](tests/test_answering.py) | The prompt file must contain the abstention phrase the code looks for. The messages: one shared system message, then the passages numbered in rank order with their text only, then the question. `is_abstention` on the phrase (case, markup, an explanation after it), paraphrases alone, and what must stay an answer (a partial answer, a paraphrase followed by facts, "the soil does not contain…"). The `answer` stage on the offline `retrieve` setup against a fake generator: one file per setup and one for the gold passage, each answer holding exactly the top-k chunks it was shown (or its own paragraph) and the evidence flag; the summary counts. A re-run asks nothing, a dropped and restored question asks nothing, another generator setting asks everything; a stale retrieval file stops the stage before any call; an API error writes no answer file and the re-run asks only it; an unusable answer is kept with its error and cached. | nothing |
 | [tests/test_quote_locator.py](tests/test_quote_locator.py) | `locate_quote`, the source of every evidence span. Exact matches, and normalized ones whose offsets still point into the original text: whitespace and paragraph breaks, typographic dashes and quotes, soft hyphens, case, an added full stop, line-break hyphenation. Fuzzy matches only above the threshold, widened to whole words, never against a span shorter than the quote. Only the unit's spans are searched, and too-short quotes are rejected. When `data/parsed/` exists, a random quote from every block of the dev docs, verbatim and with that drift (a quote occurring twice in its block is found at its first occurrence; an invisible character at its edge is left out of the span). | nothing |
 
 **Good to know:**
@@ -517,6 +518,50 @@ No LLM and no API cost. The GPU is used only to encode questions that aren't cac
 - **Overlap in the oracle:** it shows the expected effect. The share of questions whose evidence needs two chunks drops with overlap: sentence, papers from 27% to 0%; character, reports from 25% to 10%.
 - **Too few questions to rank chunkers:** only 4 of the 35 questions change their `span_hit@5` across the 6 configurations, so the dev set can't separate the methods. That needs the full question set and the paired CIs of `report`.
 
+## RAG answers (`answer`)
+
+```bash
+uv run chunkeval answer                       # every corpus; asks the generator only what isn't cached
+uv run chunkeval answer --corpus papers
+```
+
+**What it does** (`evaluation/answering.py`). Every question of `filtered.jsonl` is answered by `llm.rag_generator` (qwen3.5:9b-q8_0, temperature 0, thinking off), with the prompt in [prompts/rag_answer.md](prompts/rag_answer.md):
+- **In each of the 6 setups of its corpus,** from the top `retrieval.top_k` (5) chunks that bge-m3 (`embedding.primary`) retrieved, in rank order. Qwen3-Embedding stays a retrieval-only check. There is no budget-matched variant: the 1,300-token budget fits 4.2–5.0 chunks on average, so it would nearly repeat the k=5 run.
+- **From its gold passage** (setup `gold_passage`): the passage the question was generated from, which holds all its evidence. This is perfect retrieval, one answer per question for all setups. Stage 8 scores it like a setup, as the **ceiling** of the generation metrics:
+  - setup − gold passage is what retrieval with that chunker costs, and 1 − gold passage is the generator's and the judge's own error;
+  - a metric on which the gold passage doesn't beat the setups doesn't respond to retrieval (the previous round's relevancy was ~0.54 everywhere);
+  - its context recall should be ~1 by construction, so the shortfall measures the judge's error rate;
+  - a question answered wrongly even from its own passage points to a bad gold answer: list those for the audit.
+
+  It is generous: one clean passage without distractors, which the same Qwen model wrote the question from. Not to be confused with the retrieval `oracle` (each setup's chunks that cover the evidence), whose ceiling stage 6 already measures for free.
+
+**The prompt** (decided 2026-10-11; its notes explain each rule):
+- **Chunk text only.** No document title or section path: section paths would favour the recursive chunker, and Ragas must judge faithfulness against exactly what the generator read.
+- **Complete first, then concise:** every detail asked, with numbers and units as given, and nothing else. No reference to "the context" or passage numbers in the answer.
+- **No citations** (see [Future work](#future-work)).
+
+**Abstentions.** Only when no passage holds any of the information asked for, the generator must reply exactly "The context does not contain the answer." When the passages hold part of it, it gives that part and says nothing about what is missing (a first version that named the missing part backfired on the dev docs; see the prompt's notes). `is_abstention` marks an answer that starts with the phrase, or that is one sentence paraphrasing it ("The provided context does not mention…"); a paraphrase followed by facts counts as an answer. Why this matters:
+- **Ragas 0.2.15 scores an abstention like a wrong answer:** answer relevancy 0 (noncommittal) and factual correctness 0. Its faithfulness comes out at random (NaN, 0 or 1, depending on what the judge extracts). Context precision and recall don't read the answer.
+- **So stage 8 handles them in code** (planned in `ragas_eval.py`): relevancy and factual correctness 0 without asking the judge; faithfulness left out for abstentions and reported next to the abstention rate, plus a view with abstentions = 1. Abstentions are never dropped from every metric, because the paired comparison needs the same questions in every setup.
+- **The summary separates the two kinds of miss** with `evidence_shown` (some passage overlaps the gold evidence, i.e. span_hit at top_k): `abstained_with_evidence` (an over-cautious generator, or evidence split so it looked incomplete) and `answered_without_evidence` (a hallucination risk, unless another document holds the same fact). On the gold passage the abstention rate should be about 0.
+
+**What it writes:**
+- **`runs/<run_id>/answers/<corpus>_<setup>.jsonl`:** one `Answer` per question, in question order. `<setup>` is a variant name (`character_no_overlap`, …) or `gold_passage`. Each answer holds the `response` and the `contexts` it was shown, in rank order, which are Ragas' `response` and `retrieved_contexts`, plus the chunk ids, `evidence_shown`, `abstained`, `error`, the model and the token counts. A `.provenance.json` next to each file records the questions hash, the retrieval file's provenance, `top_k`, the generator (with its Ollama digest) and the prompt file's hash.
+- **`runs/<run_id>/answer_cache.jsonl`:** the generator's answers, one line per request, appended as they arrive. It is keyed by a hash of the messages and the generator (model, settings, digest, seed, `ANSWER_VERSION`), so a re-run asks only what is new: a new question, a question shown other chunks, or everything after a prompt or generator change. Identical requests (two setups showing the same chunks) are asked once. An answer the generator couldn't finish (cut off at `max_tokens`, context full) is cached with its `error` and has an empty response. API errors stop the stage before any answer file is written; a re-run asks exactly those.
+- **`runs/<run_id>/answer_summary.json`:** per corpus and setup: answered, abstained, errors, the abstention rate, the two miss counts above, and mean answer words and token counts.
+
+**Checks before any call:** the questions' documents still have the text `gen-qa` saw, and each bge-m3 retrieval file is up to date with the current questions, chunk file and query settings. A stale one stops the stage with "run `chunkeval retrieve` first", because its chunk ids could point to other text than it ranked.
+
+**On the dev docs** (35 questions, 2026-10-11; 244 calls, as two setups showed the same chunks once; 3.5 min at 48 tokens/s, concurrency 2):
+- **Size:** about 1,850 prompt tokens per answer from 5 chunks and 830 from the gold passage. Nothing was cut off at `max_tokens` 512. Answers from the chunks average 35–43 words per setup, from the gold passage 27–33; the gold answers average 22.
+- **Abstentions:** 2–5 per setup, 55 of 245 in all, and all but one are the bare phrase. 3 questions abstain everywhere, gold passage included, so their abstentions say nothing about the chunkers. `answered_without_evidence` is 0–1 per setup.
+- **The gold passage abstains on 7 of 35,** where about 0 was expected. Reading the passages:
+  - **5 are weak pairs:** the question asks for something the passage doesn't state in that form: a "definition" whose answer is a percentage, a circular "why", a "how" the passage doesn't explain, a premise about the SDGs the passage never mentions, and a garbled question (paper_93:s19729, report_140:s27355, report_15:s17844, report_123:s73707, paper_4:s48236). The critic passed all of them.
+  - **2 are an over-cautious generator:** paper_4:s24654 (the passage gives the reasons, hedged as "may be attributable to") and paper_74:s36976 ("threshold value" in the question, "more than 100 kg" in the passage).
+
+  Three of the seven are in the labelling sample (paper_74, paper_93, report_123); check the rest when labelling. On the full corpus, list every question the gold passage abstains on for the audit.
+- **The first version of the prompt** asked partial answers to name what was missing. It abstained less (42 in all, 5 on the gold passage), but 20 answers carried "the context does not say…" sentences, and several abstentions opened with the phrase, then gave the facts anyway. The prompt's notes have the details.
+
 ## Dependencies
 - **Installed with uv:** all the pipeline libraries, plus pytest in the dev group, plus `chunkeval` itself in editable mode.
   - **On a fresh clone,** run `uv sync`.
@@ -537,6 +582,14 @@ No LLM and no API cost. The GPU is used only to encode questions that aren't cac
   - **A cap per size.** 1024 is above `max_tokens: 512`, and the schema rejects a target above the cap. Use something like 2× the size per sweep size.
   - **Naming.** The extra chunk files and Weaviate collections need the size in their names, which `weaviate.collection_template` can't express yet.
   - **Weaviate memory.** Raise `GOMEMLIMIT` (see the Weaviate section).
+
+**Citations in the RAG answers.** Considered for `answer` and left out for now (decided 2026-10-11).
+- **What:** label the passages `[C1]`…`[C5]` and ask the generator to end each sentence with the passages it used. Keep the raw answer, give Ragas a copy with the markers stripped (they would be noise in faithfulness' statements and relevancy's generated questions), and store the cited chunk ids.
+- **Why `C`:** 25 of 191 papers chunks and 17 of 420 reports chunks on the dev docs already contain reference markers like `[12]`, `[5–11]` or `[1, 2]`, so a plain `[3]` copied from a chunk would be read as a citation.
+- **What it would give, without the judge:** whether the answer cites a chunk that overlaps the evidence; combined with `evidence_shown`, which questions had the evidence but were answered from other chunks (distraction), and which were answered from a wrong chunk (e.g. report_16 for a report_15 question, the near-duplicate case of the pilot); the rank of the chunks actually used.
+- **Limits:** a 9B model's citations are approximate (wrong block, missing ones), so they are a diagnostic, not a headline metric; check ~20 by hand first. A prompt change re-asks every answer.
+
+**Random-context check of the abstention rule.** Not implemented (decided 2026-10-11). Answer each question once more from `top_k` random chunks (the `random` retrieval files of one setup, ~35 calls on the dev docs) and count abstentions: nearly all should abstain. If many don't, the generator answers from irrelevant text and rule 7 of `prompts/rag_answer.md` isn't working. A cheap check of the prompt, best run on the dev docs after any change to it.
 
 **Models partly on the CPU.** At the moment, `check_ollama` only logs a warning when a model isn't 100% on the GPU. `test_live_check_ollama` hard-codes that both generators must be 100%. There are two situations to handle:
 - **Deliberate:** a MoE generator (only about 3B parameters active per token) is partly on the CPU by design and stays usable.

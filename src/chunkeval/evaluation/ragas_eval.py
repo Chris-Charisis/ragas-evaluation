@@ -13,9 +13,26 @@ Metrics:
                  response/answer relevancy, factual correctness (response vs reference).
   Non-LLM:       abstention rate, response length, embedding similarity / ROUGE-L / token-F1 vs reference.
 
-Scope: primary embedder (bge_m3) only — see answering.py.
+Scope: primary embedder (bge_m3) only — see answering.py. Every setup, plus the "gold_passage"
+setup: each question answered from its own passage, scored like a setup and reported as the ceiling
+next to them (setup − gold = what retrieval costs; 1 − gold = the generator's and judge's own error;
+a metric on which gold doesn't beat the setups doesn't respond to retrieval). Its context recall
+should be ~1 by construction, so the shortfall measures the judge's error rate.
 
-Reads:  runs/<run_id>/answers/*.jsonl, data/qa/filtered.jsonl
+Abstentions (decided 2026-10-11; `Answer.abstained`, see answering.is_abstention). Ragas 0.2.15 scores
+an abstention as relevancy 0 (noncommittal) and factual correctness 0, and its faithfulness at random
+(NaN, 0 or 1, depending on which statements the judge extracts). So:
+  - don't send abstentions to the judge for the response metrics: set answer relevancy and factual
+    correctness to 0 in code (what Ragas gives, without the noise); context precision and recall
+    don't read the response, so they are scored as usual;
+  - faithfulness: leave abstentions out (NaN) and count them; report it next to the abstention rate,
+    plus a sensitivity view with abstentions = 1 (an abstention makes no unsupported claim);
+  - never drop abstentions from every metric: a setup that abstains on its hard questions would look
+    better on the rest, and the paired comparison needs the same questions in every setup.
+Answers with `error` set (cut off, context full) have no response: count them per setup, as NaN.
+
+Reads:  runs/<run_id>/answers/<corpus>_<setup>.jsonl (answering.load_answers; `contexts` are the
+        retrieved_contexts as the generator read them), data/qa/filtered.jsonl
 Writes: runs/<run_id>/ragas/per_question.parquet, runs/<run_id>/ragas/cost.json
 """
 from __future__ import annotations
