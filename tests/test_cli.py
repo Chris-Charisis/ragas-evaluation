@@ -157,7 +157,17 @@ def test_main_runs_stage_saves_config_and_logs(config_file, calls, tmp_path):
 def test_main_runs_all_targets_in_order(config_file, calls):
     cli.main(["retrieve", "--config", str(config_file)])
     assert [c["target"] for c in calls] == list(cli.STAGES["retrieve"].targets)
-    assert all(c["options"] == {} for c in calls)
+    cfg = calls[0]["cfg"]
+    assert all(c["options"] == {"corpora": list(cfg.paths.corpora), "embedders": cfg.retrieval.embedders}
+               for c in calls)                                   # the same options for both targets
+
+
+def test_retrieve_embedders_default_to_the_retrieval_config(cfg):
+    cfg.retrieval.embedders = ["bge_m3"]
+    args = cli.build_parser().parse_args(["retrieve"])
+    assert cli.stage_options(cli.STAGES["retrieve"], args, cfg)["embedders"] == ["bge_m3"]
+    args = cli.build_parser().parse_args(["embed"])                # embed still embeds every model
+    assert cli.stage_options(cli.STAGES["embed"], args, cfg)["embedders"] == ["bge_m3", "qwen3_06b"]
 
 
 def test_main_stage_failure_exits_1_and_logs_traceback(config_file, monkeypatch, tmp_path):

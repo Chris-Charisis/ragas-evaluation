@@ -190,9 +190,15 @@ qa:
 
 retrieval:
   embedders: ["bge_m3", "qwen3_06b"] # which named vectors to query (answering/Ragas use the primary only)
-  mode: "dense"                      # "dense" | "hybrid" (follow-up experiment)
-  hybrid_alpha: 0.5
-  top_k: 5
+  # "dense" | "hybrid" (BM25 + dense, follow-up experiment). Recorded with every retrieval file:
+  # switching it on a run_id that already has results is refused, so bump run_id for the follow-up.
+  mode: "dense"
+  hybrid_alpha: 0.5                  # hybrid only: 1 = pure vector, 0 = pure BM25
+  top_k: 5                           # chunks handed to the RAG generator (answer)
+  # Each question gets its k_max best chunks once; the span metrics are cut from that list at each
+  # of k_values and at the budget-matched k. 20 chunks hold ~4000 tokens, far above the budget.
+  k_max: 20
+  k_values: [1, 3, 5, 10]
   budget_tokens: 1300                # for the budget-matched view (~5 x 256)
 
 ragas:

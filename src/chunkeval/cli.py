@@ -58,7 +58,8 @@ STAGES: dict[str, Stage] = {
     "filter-qa": Stage("Stage 5: deterministic checks + critic + dedup + final sample",
                        ("chunkeval.qa.filtering:run",)),
     "retrieve": Stage("Stage 6: top-k retrieval per question, collection and embedder + span metrics",
-                      ("chunkeval.evaluation.retrieval:run", "chunkeval.evaluation.retrieval_metrics:run")),
+                      ("chunkeval.evaluation.retrieval:run", "chunkeval.evaluation.retrieval_metrics:run"),
+                      ("corpora", "embedders")),
     "answer": Stage("Stage 7: RAG answers from the retrieved chunks (fixed generator)",
                     ("chunkeval.evaluation.answering:run",)),
     "eval": Stage("Stage 8: Ragas + text metrics",
@@ -66,8 +67,7 @@ STAGES: dict[str, Stage] = {
     "report": Stage("Stage 9: tables with bootstrap CIs, paired diffs, breakdowns",
                     ("chunkeval.analysis:run",)),
 }
-# TODO(you), with each stage: --embedder for retrieve,
-#   --pilot N / --bridge for eval (ragas_eval.run already takes `pilot` and `bridge`).
+# TODO(you), with each stage: --pilot N / --bridge for eval (ragas_eval.run already takes `pilot` and `bridge`).
 
 
 def _positive_int(text: str) -> int:
@@ -87,7 +87,8 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
         help="smoke test: only the first N documents per corpus"),
     "embedders": lambda p: p.add_argument(
         "--embedder", dest="embedders", action="append", metavar="NAME",
-        help="only this embedder (repeatable); default: embedding.primary, then embedding.secondary"),
+        help="only this embedder (repeatable); default: embed: embedding.primary, then embedding.secondary; "
+             "retrieve: retrieval.embedders"),
     "recreate": lambda p: p.add_argument(
         "--recreate", action="store_true",
         help="delete what this stage built before and build it again; default: reuse what is up to "
@@ -122,7 +123,10 @@ def stage_options(stage: Stage, args: argparse.Namespace, cfg: Config) -> dict[s
             raise SystemExit(f"unknown corpus {unknown}; configured: {list(cfg.paths.corpora)}")
         options["corpora"] = corpora
     if "embedders" in options:
-        embedders = list(dict.fromkeys(options["embedders"] or [cfg.embedding.primary, *cfg.embedding.secondary]))
+        # embed: every model; retrieve: the named vectors the config queries
+        default = (cfg.retrieval.embedders if args.command == "retrieve"
+                   else [cfg.embedding.primary, *cfg.embedding.secondary])
+        embedders = list(dict.fromkeys(options["embedders"] or default))
         unknown = [e for e in embedders if e not in cfg.embedding.models]
         if unknown:
             raise SystemExit(f"unknown embedder {unknown}; configured: {list(cfg.embedding.models)}")

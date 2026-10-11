@@ -268,7 +268,7 @@ def is_cached(npy_path: Path, chunks_path: Path, spec: EmbedderSpec) -> bool:
     return meta.get("chunks_sha256") == _sha256(chunks_path) and meta.get("settings") == spec.settings
 
 
-def _save_npy(path: Path, vectors: np.ndarray) -> None:
+def save_npy(path: Path, vectors: np.ndarray) -> None:
     """np.save, atomically: write a temp file in the target folder, then swap it in (as store.write_jsonl)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as tmp:
@@ -298,7 +298,7 @@ def embed_chunk_file(chunks_path: Path, embedder: Embedder, npy_path: Path, batc
 
     meta_path = npy_path.with_suffix(".json")
     meta_path.unlink(missing_ok=True)
-    _save_npy(npy_path, vectors)
+    save_npy(npy_path, vectors)
     spec = embedder.spec
     write_json(meta_path, {
         "embedder": spec.name,

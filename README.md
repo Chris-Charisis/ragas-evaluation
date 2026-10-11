@@ -18,7 +18,7 @@ The package is a **scaffold**. Each module has docstrings, signatures and `TODO(
 | 3 | `index` | `corpus/indexing.py` | chunks + both vectors → Weaviate `{corpus}_{method}_{ovl}_v2` (named vectors) |
 | 4 | `gen-qa` | `qa/generation.py` | CanonicalDoc → `data/qa/raw.jsonl` (with evidence char spans) + `gen_dropped.jsonl` (with reasons) |
 | 5 | `filter-qa` | `qa/filtering.py` | raw → `data/qa/filtered.jsonl` (+ `rejected.jsonl` with reasons, `critic_scores.jsonl` cache) |
-| 6 | `retrieve` | `evaluation/retrieval.py` + `evaluation/retrieval_metrics.py` | questions × 12 collections × 2 embedders → `runs/<id>/retrieval/<embedder>/*.jsonl` + span metrics |
+| 6 | `retrieve` | `evaluation/retrieval.py` + `evaluation/retrieval_metrics.py` | questions × 12 collections × (2 embedders + oracle + random) → `runs/<id>/retrieval/<retriever>/*.jsonl` + `runs/<id>/metrics/retrieval_per_question.parquet` |
 | 7 | `answer` | `evaluation/answering.py` | retrieved contexts → RAG responses |
 | 8 | `eval` | `evaluation/ragas_eval.py` | samples → per-question Ragas scores |
 | 9 | `report` | `analysis.py` | all per-question scores → tables with bootstrap CIs and paired diffs |
@@ -39,8 +39,8 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 
 **Options:**
 - **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
-- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed` has `--corpus` only.
-- **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`).
+- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed` and `retrieve` have `--corpus` only.
+- **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`) and on `retrieve` (default: `retrieval.embedders`).
 - **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [What `index` builds](#what-index-builds)). On `gen-qa`: delete every Q-A record, of all corpora, and generate again (see [Q-A generation](#q-a-generation-gen-qa)).
 
 **What the CLI does around every stage,** so stage code doesn't have to:
@@ -156,6 +156,10 @@ Both corpora may still be replaced by a different set of documents, so every set
 - **Two-span units are off** (`qa.two_span_ratio: 0`, decided 2026-10-11). On the 10 dev docs, at a ratio of 0.2, 20 two-span units gave 3 pairs (same section 3 of 14, across sections 0 of 6; single units: 66 of 76), and `filter-qa` rejected all 3: one names its source ("described in the abstract"), one doesn't need passage B (`needs_both` 1), and one infers more than the passages say. They took a fifth of the generator calls for no question. The code stays; a ratio above 0 brings them back. Chunk boundaries are still tested by single units, whose evidence can span several paragraphs.
 - **Critic threshold and yield.** With single units only, the 10 dev docs gave 84 pairs from 97 units, and `qa.critic_min_score: 4` keeps 35 of them (42%; at 3: 53). Calibrate the threshold with the 50 hand labels (see [Q-A filtering](#q-a-filtering-filter-qa)), then check the yield. At 4 it is 32% of units for papers and 40% for reports, so 100 documents × 10 units give ~320 and ~400 questions: papers only just above `ragas.sample_per_corpus` (300). Raise `qa.max_questions_per_doc` if the full corpus comes out lower.
 
+**Retrieval** (check after `retrieve` has run on the full corpus)
+- **Very long documents.** On the dev docs, report_123 (326k characters) holds 279 of the 420 reports chunks (66%), so most distractors in the reports collections come from one document. Check the chunks per document on the final corpus. If a few documents dominate, decide whether to cap them or to report `doc_hit` next to `span_hit`.
+- **The budget view.** `retrieve` warns when a question fits all `k_max` hits into `budget_tokens`, because its budget k is then capped. Raise `retrieval.k_max` if it does.
+
 ## Testing
 
 The tests import `chunkeval` as the installed package, so run `uv sync` once (see [Package layout](#package-layout)). pytest is in the dev dependency group, which `uv sync` installs too.
@@ -190,8 +194,10 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_indexing.py](tests/test_indexing.py), marker `weaviate` | On 6 fake chunks with hash vectors: the collection gets both named vectors (flat, cosine) and its provenance, and every object matches its chunk and cached vectors. A chunk's vector finds that chunk first in its own space. doc_id filters match whole ids, and BM25 ignores section titles. A re-run skips an up-to-date collection and refuses a stale, incomplete or hand-made one until `--recreate`. Verification catches swapped names and shifted rows, and failed inserts raise. | Weaviate running (`docker compose up -d`), `WEAVIATE_API_KEY`; touches only `*_pytest` collections |
 | [tests/test_generation.py](tests/test_generation.py) | Unit sampling on `tiny_doc` with small sizes: single units stay in one section and within the size bounds; sections that are too small get no unit; a paragraph over the max is cut into sentence groups; an over-long sentence is in no unit; two-span units are adjacent whole paragraphs (also across a section boundary); skippable sections are never used; the per-doc cap and the two-span ratio hold, and no two units overlap. The prompt file has exactly its sections and placeholders, checked on load: a missing section, a misspelt placeholder or a lone `$` fails. The chat messages: one system message shared by every call, then the title, section path, passage and question type in the user message, with passages A and B for a two-span unit. Which outputs `QA_JSON_SCHEMA` accepts (pairs, skips) and rejects, and that its question types are the config's. The generation loop against a fake LLM: pairs with located evidence, every drop reason, a two-span answer quoting one passage only, the factoid retry (single units only), the type rotation. The `gen-qa` stage: resume after a crash asks only the missing unit; drops are saved but API errors aren't (and the stage fails); other settings, another prompt, a re-parsed document or records without provenance are refused until `--recreate`. `load_pairs` reads back exactly what the stage wrote. When `data/parsed/` exists, the same unit invariants on the dev docs with the config sizes, reproducible by seed; a document with enough running text (quota × `unit_max_tokens`) fills the quota, spread over the document. | the bge-m3 tokenizer |
 | [tests/test_filtering.py](tests/test_filtering.py) | Each deterministic check on its pattern, case-insensitively, and on what it must let through ("in the context of <topic>", "farmers had no information on prices", a number spelt out in the evidence). The critic's two calls: the passage call shows the evidence as located in the text, the question call only the question, and the system messages are shared. Which outputs each call's schema accepts (note first, reason before score) and rejects. `decide` ignores the notes, and the threshold applies per criterion. De-duplication: greedy, earlier wins, within a corpus only. The `filter-qa` stage against a fake critic and embedder: each pair ends at the right stage with its reasons; a re-run or a new threshold asks nothing; a changed answer asks only its passage call; another critic setting asks everything; an API error writes nothing, and the re-run asks only what is missing; an unusable answer rejects its pair and is cached; a re-parsed document is refused; the labelling sample is blind and never overwritten. | nothing |
+| [tests/test_retrieval_metrics.py](tests/test_retrieval_metrics.py) | Every span metric on hand-computed toy cases: interval merging and overlap; a hit equal to the evidence scores 1 everywhere; the same offsets in another document score 0; overlapping hits and other documents' text count once in precision and IoU; `all_evidence` needs every quote touched (touching quotes are one); MRR and hit only see the top k; `budget_k` never returns 0. | nothing |
+| [tests/test_retrieval.py](tests/test_retrieval.py), offline | The oracle's greedy cover (hand-computed) and the random baseline's seeding. Query vectors: encoded with the query prompt, cached, encoded again after a new question or prompt. The `retrieve` stage against a fake embedder and retriever: a file per retriever with ranked hits and no text, then the metrics table (one row per question, retriever and k, unique). A re-run asks nothing; a new query prompt redoes only that embedder; a new question set redoes everything; a mode switch is refused; a question's document without chunks, or chunks cut from another parse, stop the stage. The metrics leave out stale files outside the run's scope, with a warning, and fail on stale files inside it. | nothing |
+| [tests/test_retrieval.py](tests/test_retrieval.py), marker `weaviate` | `WeaviateRetriever` on a `*_pytest` collection: a chunk's own vector finds it first with cosine 1, in the named vector asked; an unknown vector name fails; hybrid with alpha 0 is BM25; a collection built from other chunks, or a missing one, is refused. | Weaviate running, `WEAVIATE_API_KEY` |
 | [tests/test_quote_locator.py](tests/test_quote_locator.py) | `locate_quote`, the source of every evidence span. Exact matches, and normalized ones whose offsets still point into the original text: whitespace and paragraph breaks, typographic dashes and quotes, soft hyphens, case, an added full stop, line-break hyphenation. Fuzzy matches only above the threshold, widened to whole words, never against a span shorter than the quote. Only the unit's spans are searched, and too-short quotes are rejected. When `data/parsed/` exists, a random quote from every block of the dev docs, verbatim and with that drift (a quote occurring twice in its block is found at its first occurrence; an invisible character at its edge is left out of the span). | nothing |
-| `test_retrieval_metrics.py` | Placeholders (`pytest.skip("TODO(you)")`) for the module that isn't written yet. They show as `s`. | — |
 
 **Good to know:**
 - **Live tests skip themselves** when their service isn't available. If Ollama isn't running, `uv run pytest` still passes, and the live tests show as skipped instead of failing.
@@ -458,6 +464,58 @@ The detailed findings below come from the first run (69 pairs, two-span units st
 - **Compared with a first reading of 33 pairs (7 bad, 8 borderline, 18 good):** 6 of 7 bad rejected, 4 of 18 good rejected. Two of those four are specificity errors (a question naming CADFund scored 3); the other two are defensible. The bad pair it kept answers "Which organisation has FAO worked under?" with "FAO"; the same critic rejected it under an earlier prompt, so its answers on borderline cases are not stable across prompt versions.
 - **De-duplication:** nothing removed (no two questions above 0.92).
 - **How the prompt got there:** a first version with one-line criteria passed 50 of 56 pairs with 5 on every criterion. Raising the reasoning effort to medium or high didn't help. Asking for a note before the scores fixed the answer criteria. Judging the question without the passage fixed `standalone` and `specificity`: with the passage in view, the critic resolved "the full model" from it and never listed an unresolved reference.
+
+## Retrieval and span metrics (`retrieve`)
+
+```bash
+uv run chunkeval retrieve                          # every corpus, retrieval.embedders, both baselines; then the metrics
+uv run chunkeval retrieve --embedder qwen3_06b     # only Qwen's files (e.g. after changing its query prompt)
+```
+
+No LLM and no API cost. The GPU is used only to encode questions that aren't cached, and the stage stops (`check_gpu_free`) while Ollama holds a model. On the 10 dev docs the whole stage takes 8 s, and a re-run with nothing changed takes 0.3 s.
+
+**What it does** (`evaluation/retrieval.py`). Every question of `filtered.jsonl` gets its `retrieval.k_max` (20) best chunks from each of the 6 collections of its own corpus, for each retriever:
+- **Each embedder** searches its own named vector (`target_vector`) with the question encoded by `Embedder.encode_queries`: bge-m3 without an instruction, Qwen3 with its `query_prompt`. The query vectors are cached in `data/embeddings/queries/<embedder>/<corpus>.npy`, keyed by the questions and the query settings (model, revision, prompt).
+  - **`retrieval.mode: dense`** scores by cosine similarity.
+  - **`hybrid`** fuses it with BM25 on `text`, weighted by `hybrid_alpha`: 1 is pure vector, 0 pure BM25.
+- **Oracle**, per (corpus, method, overlap): the chunks of the question's own document that cover its evidence, chosen greedily by how many evidence characters each adds that aren't covered yet. It stops once all of the evidence is covered, so it usually has 1–2 hits. This is the ceiling a chunker allows, which separates "the chunker can't" from "the retriever didn't". Its `context_tokens` is how much text that chunker needs to hand over the whole evidence.
+- **Random**: `k_max` chunks drawn from the variant's chunks of the whole corpus, seeded per question and variant. This is the chance level.
+
+**Checks before anything is retrieved,** so no metric compares offsets into two different texts:
+- The questions' documents still have the text `gen-qa` saw (the hashes in `raw.provenance.json`).
+- Every one of those documents has chunks, and each of its chunks is `doc.text[start:end]`. This catches documents that were parsed after `chunk` ran, which happened on the dev docs on 2026-10-11.
+- Each collection was built from exactly the current chunk file: its `index` provenance and object count are checked.
+
+**What it writes:**
+- **`runs/<run_id>/retrieval/<retriever>/<corpus>_<method>_<ovl>.jsonl`:** one line per question, `{"question_id", "hits": [...]}`, with each hit's rank, chunk_id, doc_id, offsets, n_tokens and score. The chunk text isn't stored: at 20 hits it would repeat each corpus many times over, and the chunk file has it by chunk_id. `<retriever>` is an embedder name, `oracle` or `random`.
+- **A `.provenance.json` next to each file:** the chunk file's hash, a hash of the questions (ids, text, evidence spans), `k_max`, plus the query settings and mode for an embedder, or the seed for random.
+  - **On a re-run,** an up-to-date file is skipped and a stale one is retrieved again.
+  - **A different `mode` or `hybrid_alpha` is refused** instead: that is another experiment, so bump `run_id`.
+- **`runs/<run_id>/metrics/retrieval_per_question.parquet`** (`evaluation/retrieval_metrics.py`): the long table, one row per (question_id, embedder, corpus, method, overlap, k_label).
+  - `k_label` is each of `retrieval.k_values` (1, 3, 5, 10), plus `budget`: the largest k whose chunks fit in `retrieval.budget_tokens`.
+  - The baselines are rows with `embedder` `oracle` or `random`.
+  - Each row also carries the question's doc_id, type, kind, section, number of evidence intervals and evidence length, for the breakdowns.
+  - It covers the whole configured grid. A file outside this run's `--corpus` / `--embedder` that is missing or stale is left out, with a warning naming it.
+- **`runs/<run_id>/retrieval_summary.json`:** the means per corpus, retriever, variant and k. They are also logged at `top_k` and at the budget.
+
+**The metrics, in characters** (decided 2026-10-11). The spans are character offsets into the same text, so the overlaps are exact and need no tokenizer; only `context_tokens` counts bge-m3 tokens. E is the evidence quotes merged into intervals, and R is the merged union of the top-k chunks: overlapping chunks count once, and other documents' text counts in |R|.
+
+| Metric | Definition |
+|---|---|
+| `doc_hit` | some top-k chunk is from the question's document |
+| `span_hit` | some top-k chunk of that document overlaps E |
+| `all_evidence` | every interval of E is touched. Defined for every pair, not only two-span ones: 22 of the 35 dev pairs have 2–3 quotes. With one interval it equals `span_hit`. |
+| `span_recall` | \|E ∩ R\| / \|E\| |
+| `precision` | \|E ∩ R\| / \|R\| |
+| `iou` | \|E ∩ R\| / \|E ∪ R\| |
+| `mrr` | 1 / rank of the first chunk overlapping E, 0 if none in the top k (the mean is MRR@k) |
+| `context_tokens` | sum of n_tokens of the top k; overlapping chunks count fully, since the generator reads both |
+
+**On the dev docs** (35 questions, 2026-10-11):
+- **The embedders:** at k=5, `span_hit` is 0.89 (papers) and 0.88 (reports) for bge-m3, and 0.90 and 0.91 for Qwen3. `span_recall` is 0.85–0.89.
+- **The baselines:** random is about 0, and the oracle needs 1.1–1.2 chunks on average (at most 2).
+- **Overlap in the oracle:** it shows the expected effect. The share of questions whose evidence needs two chunks drops with overlap: sentence, papers from 27% to 0%; character, reports from 25% to 10%.
+- **Too few questions to rank chunkers:** only 4 of the 35 questions change their `span_hit@5` across the 6 configurations, so the dev set can't separate the methods. That needs the full question set and the paired CIs of `report`.
 
 ## Dependencies
 - **Installed with uv:** all the pipeline libraries, plus pytest in the dev group, plus `chunkeval` itself in editable mode.

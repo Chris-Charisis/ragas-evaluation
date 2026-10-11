@@ -177,7 +177,20 @@ class Retrieval(StrictConfig):
     mode: Literal["dense", "hybrid"]
     hybrid_alpha: float = Field(ge=0, le=1)
     top_k: int = Field(gt=0)
+    k_max: int = Field(gt=0)
+    k_values: list[Annotated[int, Field(gt=0)]] = Field(min_length=1)
     budget_tokens: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def check_k(self):
+        # every k is cut from the k_max hits retrieved once
+        too_large = [k for k in (self.top_k, *self.k_values) if k > self.k_max]
+        if too_large:
+            raise ValueError(f"top_k and k_values must be <= k_max ({self.k_max}), got {too_large}")
+        # a repeated k would give two metric rows with the same key
+        if len(set(self.k_values)) != len(self.k_values):
+            raise ValueError(f"retrieval.k_values has a repeated value: {self.k_values}")
+        return self
 
 class Ragas(StrictConfig):
     embeddings_model: str
