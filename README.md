@@ -21,7 +21,7 @@ The package is a **scaffold**. Each module has docstrings, signatures and `TODO(
 | 6 | `retrieve` | `evaluation/retrieval.py` + `evaluation/retrieval_metrics.py` | questions × 12 collections × (2 embedders + oracle + random) → `runs/<id>/retrieval/<retriever>/*.jsonl` + `runs/<id>/metrics/retrieval_per_question.parquet` |
 | 7 | `answer` | `evaluation/answering.py` + `prompts/rag_answer.md` | questions × 6 setups per corpus (bge-m3's top `top_k` chunks) + the gold passage → `runs/<id>/answers/<corpus>_<setup>.jsonl` (+ `answer_cache.jsonl`) |
 | 8 | `eval` | `evaluation/ragas_eval.py` | each corpus's Ragas sample × 7 answer files → `runs/<id>/ragas/per_question.parquet` (+ `details.jsonl`, `cost.json`; the judge's calls in `ragas_cache.jsonl`) |
-| 9 | `report` | `analysis.py` | all per-question scores → tables with bootstrap CIs and paired diffs |
+| 9 | `report` | `analysis/` | both per-question tables → a new `runs/<id>/reports/<YYYYMMDD-HHMMSS>/` per run (`reports/latest` links the newest): `report.md`, `cases.md`, tables (CSV) and figures, with bootstrap CIs and paired comparisons |
 
 Every stage reads `configs/default.yaml` and writes its own artefacts, so you can re-run any stage without repeating the earlier ones.
 
@@ -84,7 +84,11 @@ src/chunkeval/
 │   ├── retrieval_metrics.py
 │   ├── answering.py
 │   └── ragas_eval.py
-└── analysis.py         stage 9: report tables
+└── analysis/           stage 9: the report
+    ├── inputs.py       loads both tables and checks they belong together
+    ├── stats.py        bootstrap, paired comparisons, the ranking rule
+    ├── views.py        every table
+    ├── plots.py, cases.py, report.py   figures, the case file, report.md
 ```
 
 **Conventions:**
@@ -129,7 +133,7 @@ src/chunkeval/
 5. `qa/generation.py`, then `qa/filtering.py`. Hand-label 50 pairs.
 6. `evaluation/retrieval.py` and `evaluation/retrieval_metrics.py` on all 12 configs × 2 embedders. This step has **no API cost** and is the first decision point.
 7. `evaluation/answering.py` (primary embedder only), then `evaluation/ragas_eval.py`: `eval --dry-run` for the cost estimate, `eval --pilot 20` to measure the real cost per question, then the full run.
-8. `analysis.py`, including the embedder robustness table.
+8. `analysis/`, including the embedder robustness table.
 
 ## Before the QA stage: audit the final corpus
 
@@ -167,7 +171,7 @@ The tests import `chunkeval` as the installed package, so run `uv sync` once (se
 
 ```bash
 uv run pytest                                   # everything (~35 s with Ollama running and a free GPU)
-uv run pytest -m "not ollama and not openai and not gpu and not weaviate"   # offline tests only (~5 s): run after every change
+uv run pytest -m "not ollama and not openai and not gpu and not weaviate"   # offline tests only (~20 s): run after every change
 uv run pytest -m gpu                            # embedding models on the GPU (~10 s): run after changing embedding.py or the models
 uv run pytest -m weaviate                       # the local Weaviate (~15 s): run after changing indexing.py or the Weaviate version
 uv run pytest -m ollama                         # live Ollama tests only: run after upgrading Ollama or changing models
@@ -200,6 +204,7 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_retrieval.py](tests/test_retrieval.py), marker `weaviate` | `WeaviateRetriever` on a `*_pytest` collection: a chunk's own vector finds it first with cosine 1, in the named vector asked; an unknown vector name fails; hybrid with alpha 0 is BM25; a collection built from other chunks, or a missing one, is refused. | Weaviate running, `WEAVIATE_API_KEY` |
 | [tests/test_answering.py](tests/test_answering.py) | The prompt file must contain the abstention phrase the code looks for. The messages: one shared system message, then the passages numbered in rank order with their text only, then the question. `is_abstention` on the phrase (case, markup, an explanation after it), paraphrases alone, and what must stay an answer (a partial answer, a paraphrase followed by facts, "the soil does not contain…"). The `answer` stage on the offline `retrieve` setup against a fake generator: one file per setup and one for the gold passage, each answer holding exactly the top-k chunks it was shown (or its own paragraph) and the evidence flag; the summary counts. A re-run asks nothing, a dropped and restored question asks nothing, another generator setting asks everything; a stale retrieval file stops the stage before any call; an API error writes no answer file and the re-run asks only it; an unusable answer is kept with its error and cached. | nothing |
 | [tests/test_ragas_eval.py](tests/test_ragas_eval.py) | Each of the 5 Ragas metrics run by Ragas itself (`single_turn_ascore`) and by the stage's per-call pipeline on the same fake judge: the same prompts and the same scores. Factual correctness checks claims with faithfulness' prompt, so the two share calls. The judge request (the config's model, temperature and seed) and each call's tokens and cost. The sample is nested and in file order; the text metrics; telemetry is off. The `eval` stage against a fake judge and embedder: a row per question and setup, one of them hand-computed; abstentions scored in code and never sent; no prompt sent twice; a re-run asks nothing, a new answer asks only its response calls; an API error writes nothing and the re-run asks only it; an unreadable output is cached after Ragas' 3 fix-up requests and scores NaN; a dry run and an estimate above the cap ask nothing; the cap stops a run whose estimate was too low; the full run reuses the pilot's calls; a corpus outside `--corpus` comes from the cache alone, or is left out with a warning when a call is missing; stale answers are refused. | nothing |
+| [tests/test_analysis.py](tests/test_analysis.py) | The statistics on hand-computed cases:<br>• the bootstrap drops and counts NaN and is seeded per cell;<br>• the document-level interval is wider when one document carries the effect;<br>• paired differences align by question and drop NaN pairs;<br>• Holm by hand;<br>• the ranking rule needs both the interval and Holm (the dev example passes neither);<br>• "few documents" is flagged when the effect sits in one of 29 documents;<br>• the smallest detectable difference.<br><br>Also each answer's outcome and the tercile labels.<br><br>The `report` stage on the offline pipeline (one variant, 3 questions):<br>• it writes every file;<br>• every row lands in exactly one outcome;<br>• each run writes a new folder (`-2` within the same second), keeps the earlier one and moves `latest`;<br>• without a Ragas table, the report covers retrieval only;<br>• a stale evidence flag, `details.jsonl` or retrieval table is refused with the stage to re-run.<br><br>When the run has a Ragas table, the stage also runs on a copy of it, checked on invariants only. | nothing |
 | [tests/test_quote_locator.py](tests/test_quote_locator.py) | `locate_quote`, the source of every evidence span. Exact matches, and normalized ones whose offsets still point into the original text: whitespace and paragraph breaks, typographic dashes and quotes, soft hyphens, case, an added full stop, line-break hyphenation. Fuzzy matches only above the threshold, widened to whole words, never against a span shorter than the quote. Only the unit's spans are searched, and too-short quotes are rejected. When `data/parsed/` exists, a random quote from every block of the dev docs, verbatim and with that drift (a quote occurring twice in its block is found at its first occurrence; an invisible character at its edge is left out of the span). | nothing |
 
 **Good to know:**
@@ -598,7 +603,7 @@ Each row also carries `abstained`, `answer_error`, `evidence_shown`, `response_w
 - **`factual_correctness`** is Ragas' standard score, comparable with other Ragas reports. It counts as wrong any true claim the gold answer doesn't state, such as the question's own wording, the source's name or an extra correct detail.
 - **`fc_recall`** asks "is the right answer in it?": the share of the gold answer's claims the answer contains. `fc_precision` asks "does it say only that?", and `fc_f1` combines the two.
 
-**For stage 9:** what the report must do with this table is written in [analysis.py](src/chunkeval/analysis.py): the abstention views, the gold passage as the ceiling and as a check on the judge, the join with the retrieval table, and the questions to read by hand.
+**For stage 9:** what the report does with this table is in [Report](#report-report) and in [analysis/\_\_init\_\_.py](src/chunkeval/analysis/__init__.py): the abstention views, the gold passage as the ceiling and as a check on the judge, the join with the retrieval table, and the questions to read by hand.
 
 **Abstentions** (decided 2026-10-11, see [RAG answers](#rag-answers-answer)): the response metrics don't ask the judge. Relevancy, every factual-correctness score and the three text metrics are 0, which is what Ragas would give; faithfulness is NaN, to be reported next to the abstention rate, with a view where abstentions count as 1. Context precision and recall don't read the response, so they are scored as usual. An answer with an `error` has its response metrics NaN.
 
@@ -644,7 +649,101 @@ Each row also carries `abstained`, `answer_error`, `evidence_shown`, `response_w
   - **Faithfulness and relevancy don't:** faithfulness 0.96 vs 0.94, near its ceiling; relevancy 0.79 vs 0.81, as flat as in the previous round.
 - **No chunker ranking:** the setups differ by a few questions, as in retrieval (the paired CIs are stage 9's).
 
+## Report (`report`)
+
+```bash
+uv run chunkeval report          # no LLM and no API call: free, and safe to re-run (~10 s on the dev docs)
+```
+
+**What it writes** (`analysis/`): a new folder on every run, `runs/<run_id>/reports/<YYYYMMDD-HHMMSS>/`. The name uses the logs' timestamp format, with `-2` added when two runs fall in the same second. Earlier reports are kept: delete old folders by hand when they're no longer needed (~2.6 MB each on the dev docs). `reports/latest` is a symlink to the newest report, so one path always opens it. A folder appears only once it is complete: it is written as `<name>.tmp` and renamed at the end.
+- **`report.md`:** the report, in reading order. It opens with how to read it and the run record, then covers the question set, retrieval, generation, breakdowns, chunk sizes, cost, planning and the questions to read by hand, and ends with the secondary views.
+- **`cases.md`:** a card per question worth reading by hand (see below).
+- **`run_record.json`:** what was measured: questions and documents per corpus, the Ragas sample, chunking settings, model and embedder pins, the answer prompt's hash, the analysis settings and the judge's cost.
+- **`tables/*.csv`:** every table, with every metric. The Markdown shows only the headline ones.
+- **`figures/*.png`:** the figures. Each one also has a table with the same numbers.
+- **`secondary/`:** the secondary views' tables and figures.
+
+**Checks before anything is computed** (`analysis/inputs.py`). The two long tables carry no provenance of their own, so the stage checks that they belong together and names the stage to re-run:
+- the retrieval table holds exactly the questions of `filtered.jsonl` (else `retrieve`);
+- the bge-m3 retrieval files are up to date (else `retrieve`);
+- the Ragas table has every setup on the same questions and on the Ragas sample, and every retrieved row's `evidence_shown` equals the retrieval table's `span_hit` at `top_k` (else `answer`, then `eval`);
+- `details.jsonl` has exactly the table's rows (else `eval`).
+
+Without a Ragas table, the report covers retrieval only.
+
+**The ranking rule** (decided 2026-10-12; `analysis/stats.py`). Every comparison is paired: the difference is taken per question, then averaged. A setup is called higher or lower than the baseline only when both of these hold:
+1. its paired bootstrap CI excludes 0;
+2. its Wilcoxon signed-rank p-value, Holm-adjusted within its family, is below `1 − analysis.ci`. A family is one corpus, one metric and one k: the 5 setups compared with the baseline.
+
+The reasoning:
+- **Many comparisons.** The report makes well over 100 comparisons (6 setups, ~10 metrics, 2 corpora, two k views). A 95% CI excludes 0 by chance about 1 time in 20, so even if every chunker were identical, ~5 "winners" would appear.
+- **The two tests answer different questions.** The CI says how big the difference is. The Wilcoxon test says whether the per-question differences lean one way more than chance would give; it uses only the questions that changed.
+- **Holm** keeps the chance of even one false winner per family below alpha. It sorts the family's p-values, multiplies the smallest by 5, the next by 4, and so on, keeping them non-decreasing. It is less strict than multiplying them all by 5 (Bonferroni).
+- **Dev example:** on reports, `fc_recall` of `sentence_overlap` − baseline is +0.16 with CI [0.03, 0.32], so the CI alone would rank it. But only 4 of the 20 questions change, and its p of 0.066 becomes 0.33 after Holm: no difference shown.
+
+Each comparison also lists how many questions are better, equal or worse (`+ / = / −`), with the number of questions behind it and how many pairs were dropped for NaN.
+
+**Intervals by document** (decided 2026-10-12). The bootstrap redraws questions, as if each were independent. But questions of one document fail or succeed together: a garbled OCR layer, or a near-duplicate document, affects them all.
+- **What is added:** every paired comparison also gets a CI that redraws whole documents with all their questions.
+- **The flag:** "few documents" marks a difference whose question-level CI excludes 0 but whose document-level CI doesn't. Such a difference rests on a few documents. Dev example: 4 of the 7 papers questions behind `recursive_no_overlap`'s +0.17 `fc_recall` are from paper_4.
+- **Its limit:** the document-level CI needs many documents. Below 20 (`stats.MIN_CLUSTER_DOCS`) it is computed but marked unreliable, as on the dev docs (5 per corpus).
+
+**What the report shows** (decided 2026-10-12):
+- **Retrieval:**
+  - the span metrics at `top_k` and at the token budget, with the oracle (chunks and tokens needed) and random as references;
+  - the paired comparisons with the baseline;
+  - the span metrics as k grows;
+  - the questions whose result changes between setups: the chunker differences come only from these;
+  - per document: hit rates and the share of the corpus's chunks;
+  - distractors: which documents' chunks take the top-k slots of other documents' questions;
+  - the embedder check: both rankings side by side, Kendall's tau, the chunker's gain against the embedder's, and the spread between setups under each embedder.
+- **Generation:**
+  - **where the answers end up:** each row by whether retrieval showed the evidence, then by what the answer did with it (all gold claims, some, none, abstained). Without the evidence, an answer with gold claims was found elsewhere (or guessed), and one without is a hallucination risk;
+  - the means with the gold passage as the ceiling, and the paired comparisons with the baseline;
+  - which metrics respond to retrieval: per question, gold passage − mean of the setups;
+  - the judge's check on the gold passage;
+  - the abstention views;
+  - the judge against the spans: agreement, and where the judge's useful chunks come from;
+  - the text metrics against `fc_recall`, the scores split by `evidence_shown`, and score distributions.
+- **Breakdowns:** by question type, by number of evidence quotes (1 vs 2+: where chunk boundaries should matter most, now that two-span units are off), by evidence length (terciles per corpus) and by kind (only when two-span pairs exist). There is no breakdown by section: on the dev docs, 35 questions have 33 sections.
+- **The rest:**
+  - chunk sizes and cost (the judge's and the generator's tokens);
+  - **the smallest detectable difference** per metric, now and at `ragas.sample_per_corpus` questions, to size the final run before paying for the judge. It uses the spread of the per-question differences, at the level Holm requires of a family's smallest p-value, with 80% power;
+  - the run record.
+- **The case file** (`cases.md`). A question gets a card when:
+  - the gold passage abstains or misses gold claims;
+  - the judge scores the gold passage's context below 1;
+  - Ragas' factual correctness scores a correct answer 0;
+  - the setups differ on `span_hit` or `fc_recall`;
+  - no setup retrieves the evidence;
+  - or the judge and the spans disagree.
+
+  Each card has the question, gold answer and evidence quotes. Per setup, it shows the top-k chunks (✓ overlaps the evidence, · same document, else the other document's id), the judge's verdicts by rank, the scores and the outcome. Then come the answers, with identical ones grouped.
+- **Secondary views** (diagnostics, not results; in `secondary/` and at the end of `report.md`):
+  - context tokens handed over against span recall;
+  - answer quality by the rank of the first chunk holding the evidence;
+  - metric correlations;
+  - scores by answer length.
+- **A small set is flagged, never skipped.** Every output is produced on the dev set too. Cells under 10 questions are marked †, and `report.md` opens with a warning below 100 questions per corpus.
+
+**Figures:** colours checked with a colour-blind-safety validator.
+- A chunking method keeps its hue in every figure (blue, orange, aqua), and overlap is the marker fill: filled with overlap, hollow without.
+- The gold passage and the oracle are ink diamonds.
+- The outcome bars use a blue ramp for "evidence shown" and an orange one for "not shown".
+
+**On the dev docs** (35 questions, 2026-10-12; 8 s; 31 tables, 13 figures, 24 cards):
+- **Generation comparisons:** none of 130 passes the ranking rule.
+- **Retrieval comparisons:** 6 of 160 pass, all on `precision` and `iou`, for setups with overlap. That is mechanical: precision and IoU count text that overlapping chunks repeat once, while `context_tokens` (what the generator reads) counts it every time. The report says so next to the table.
+- **The judge checked on the gold passage:** context precision and recall are 1 on all 35 gold rows.
+  - Where the judge and the spans disagree, its useful chunks come from the same document outside the evidence (20) or from report_16 (8).
+  - Ragas' factual correctness follows claim precision almost exactly (Spearman 0.99). Both fall with answer length (−0.3 to −0.46), while `fc_recall` hardly does (−0.13 to −0.23).
+- **Which metrics respond to retrieval** (gold passage − setups):
+  - shown for context precision in both corpora, and for factual correctness, `fc_precision`, ROUGE-L and token F1 on reports;
+  - `fc_recall`'s gap (+0.07 papers, +0.10 reports) isn't shown with 15–20 questions.
+- **Smallest detectable difference at 300 questions per corpus**, from the dev spread (recompute on the final corpus): `span_recall` 0.04–0.05, `factual_correctness` 0.05–0.07, `fc_recall` 0.07–0.10.
+
 ## Dependencies
+- **Declared directly** (2026-10-12): `numpy`, `pandas`, `pyarrow`, `scipy` and `tabulate`, which `analysis/` imports and which came only through other packages before. They were added with `uv add --no-sync` and installed with `uv sync --inexact`, which kept the extra CUDA libraries.
 - **Installed with uv:** all the pipeline libraries, plus pytest in the dev group, plus `chunkeval` itself in editable mode.
   - **On a fresh clone,** run `uv sync`.
   - **On the existing `.venv`,** use `uv sync --inexact`. It also holds packages that aren't in the lockfile (CUDA 12 libraries left over from the torch upgrade), and a plain `uv sync` would uninstall them.

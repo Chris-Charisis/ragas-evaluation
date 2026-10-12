@@ -14,10 +14,13 @@ dependencies = [
     "jsonschema>=4.26.0",
     "langchain>=0.3.26",
     "matplotlib>=3.11.2",
+    "numpy>=2.3.1",
     "openai>=1.95.0",
+    "pandas>=2.3.1",
     "pillow>=11.3.0",
     "pip>=25.1.1",
     "protobuf>=6.31.1",
+    "pyarrow>=20.0.0",
     "pydantic>=2.13.4",
     "pypdfium2>=5.13.0",
     "pysbd>=0.3.4",
@@ -28,8 +31,10 @@ dependencies = [
     "rouge-score>=0.1.2",
     "sacrebleu>=2.5.1",
     "safetensors==0.4.3",
+    "scipy>=1.16.0",
     "sentence-transformers>=5.0.0",
     "sentencepiece>=0.2.0",
+    "tabulate>=0.9.0",
     "tqdm>=4.67.1",
     "typer>=0.26.8",
     "weaviate-client>=4.22.0",
@@ -69,7 +74,8 @@ markers = [
 # ---------------------------------------------------------------------------
 # Installed for v2: docling (parsing), pysbd (sentences), rapidfuzz (quote locator),
 # openai (LLM client), python-dotenv, pyyaml, pydantic (config), typer (optional CLI),
-# matplotlib (plots), rouge-score (text metrics), pytest (dev group).
+# matplotlib (plots), rouge-score (text metrics), pytest (dev group); numpy, pandas, pyarrow, scipy,
+# tabulate (report: tables, bootstrap and Wilcoxon, Markdown tables), declared since they're imported directly.
 # Note: docling upgraded torch 2.7.1 -> 2.14.1 (+cu130), which supports the RTX 5070 Ti (sm_120).
 #
 # "ragas>=<latest>"   # TODO(you): still 0.2.15 — read the changelog/migration guide before upgrading
