@@ -107,7 +107,7 @@ STAGE_LLM_ROLES = {
     "gen-qa": ["qa_generator"],
     "filter-qa": ["qa_critic"],
     "answer": ["rag_generator"],
-    "eval": ["judge", "bridge_judge"],   # bridge_judge: one-config gpt-4o run, to measure the judge effect vs the previous round
+    "eval": ["judge"],
 }
 # The `Secrets` field each provider needs.
 PROVIDER_SECRET = {"ollama": "ollama_base_url", "openai": "openai_api_key"}

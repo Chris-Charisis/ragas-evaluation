@@ -400,11 +400,10 @@ def test_live_unload(live):
 # ======================================================================================
 
 @pytest.mark.openai
-@pytest.mark.parametrize("role", ["judge", "bridge_judge"])
-def test_live_openai_judge_snapshot_exists(cfg, role):
+def test_live_openai_judge_snapshot_exists(cfg):
     """Key is valid and the pinned snapshot hasn't been retired — check before an eval run."""
     secrets = load_secrets()
     if secrets.openai_api_key is None:
         pytest.skip("OPENAI_API_KEY not set")
-    llm = ChatLLM(role, cfg, secrets)
+    llm = ChatLLM("judge", cfg, secrets)
     assert llm.client.models.retrieve(llm.model).id == llm.model

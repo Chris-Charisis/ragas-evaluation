@@ -62,12 +62,11 @@ STAGES: dict[str, Stage] = {
                       ("corpora", "embedders")),
     "answer": Stage("Stage 7: RAG answers from the retrieved chunks and the gold passage (fixed generator)",
                     ("chunkeval.evaluation.answering:run",), ("corpora",)),
-    "eval": Stage("Stage 8: Ragas + text metrics",
-                  ("chunkeval.evaluation.ragas_eval:run",)),
+    "eval": Stage("Stage 8: Ragas metrics (OpenAI judge, cost-capped) + judge-free text metrics per question and setup",
+                  ("chunkeval.evaluation.ragas_eval:run",), ("corpora", "pilot", "dry_run")),
     "report": Stage("Stage 9: tables with bootstrap CIs, paired diffs, breakdowns",
                     ("chunkeval.analysis:run",)),
 }
-# TODO(you), with each stage: --pilot N / --bridge for eval (ragas_eval.run already takes `pilot` and `bridge`).
 
 
 def _positive_int(text: str) -> int:
@@ -93,6 +92,13 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
         "--recreate", action="store_true",
         help="delete what this stage built before and build it again; default: reuse what is up to "
              "date, refuse what is stale (index: the selected collections; gen-qa: all Q-A records)"),
+    "pilot": lambda p: p.add_argument(
+        "--pilot", type=_positive_int, metavar="N",
+        help="only the first N questions of each corpus's Ragas sample, to measure the cost per question; "
+             "a later full run reuses what the pilot paid for"),
+    "dry_run": lambda p: p.add_argument(
+        "--dry-run", action="store_true",
+        help="estimate the judge's cost of everything not cached yet, then stop: no API call, nothing written"),
 }
 
 

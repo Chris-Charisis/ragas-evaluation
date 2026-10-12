@@ -159,12 +159,12 @@ llm:
   qa_generator:  {provider: "ollama", model: "qwen3.5:9b-q8_0", temperature: 0.7, max_tokens: 512, reasoning_effort: "none"}
   qa_critic:     {provider: "ollama", model: "gpt-oss:20b",     temperature: 0.0, max_tokens: 1024, reasoning_effort: "low"}  # reasoning needs headroom
   rag_generator: {provider: "ollama", model: "qwen3.5:9b-q8_0", temperature: 0.0, max_tokens: 512, reasoning_effort: "none"}
-  # Judge: dated snapshot, non-reasoning, so temperature 0 applies ($0.40 / $1.60 per 1M tokens, Oct 2026).
-  # The GPT-5.6 / GPT-6 models have no dated snapshots, so they can't be pinned.
+  # Judge (Ragas, stage 8): dated snapshot, non-reasoning, so temperature 0 applies; its price is in
+  # ragas.prices. The GPT-5.6 / GPT-6 models have no dated snapshots, so they can't be pinned.
+  # No second judge: a gpt-4o "bridge" run to compare with the previous round was dropped (2026-10-11).
   judge:         {provider: "openai", model: "gpt-4.1-mini-2025-04-14", temperature: 0.0}
-  # The "gpt-4o" alias points to this snapshot; pinned so the alias can't move under the comparison.
-  bridge_judge:  {provider: "openai", model: "gpt-4o-2024-08-06"}  # one config only, for comparability with the docx
-  # Re-check https://developers.openai.com/api/docs/deprecations before the eval run.
+  # Re-check https://developers.openai.com/api/docs/deprecations before the eval run
+  # (2026-10-11: no shutdown date announced for the judge).
 
 qa:
   docs_per_corpus: 100
@@ -202,12 +202,22 @@ retrieval:
   budget_tokens: 1300                # for the budget-matched view (~5 x 256)
 
 ragas:
-  embeddings_model: "BAAI/bge-m3"    # used by answer relevancy only; fixed for the whole run
+  # Questions per corpus that `eval` scores, the same ones in every setup (paired). Drawn by a seeded
+  # hash rank, so a smaller sample is the start of a larger one: the `--pilot` questions are part of
+  # the full run, and raising this value only adds questions. All of them when a corpus has fewer.
+  # Kept as a cost guardrail (decided 2026-10-12): ~$0.04 per question across its 7 setups. The sample is
+  # not stratified (README "Future work").
   sample_per_corpus: 300             # TODO(you): size after the 20-question pilot cost check
-  max_workers: 2
-  timeout: 600
-  max_retries: 5
-  max_wait: 60
+  max_workers: 2                     # judge requests in flight; raise for the full corpus if the rate limit allows
+  timeout: 120                       # seconds per judge request (the openai SDK's timeout)
+  max_retries: 5                     # per request, by the openai SDK (backoff, honours Retry-After)
+  # `eval` estimates the cost of every judge call it doesn't have cached and refuses to start above
+  # this; while running it stops asking once the new spend reaches it (what was paid stays cached).
+  # Dev docs: $1.29 measured for all 35 questions. Full corpus at 300 per corpus: ~$22 (raise it then).
+  max_cost_usd: 5
+  # USD per 1M tokens (OpenAI list prices, Oct 2026), by judge model; the judge's must be here.
+  prices:
+    "gpt-4.1-mini-2025-04-14": {input: 0.40, output: 1.60}
 
 analysis:
   bootstrap_iterations: 2000

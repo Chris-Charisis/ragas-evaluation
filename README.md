@@ -20,7 +20,7 @@ The package is a **scaffold**. Each module has docstrings, signatures and `TODO(
 | 5 | `filter-qa` | `qa/filtering.py` | raw → `data/qa/filtered.jsonl` (+ `rejected.jsonl` with reasons, `critic_scores.jsonl` cache) |
 | 6 | `retrieve` | `evaluation/retrieval.py` + `evaluation/retrieval_metrics.py` | questions × 12 collections × (2 embedders + oracle + random) → `runs/<id>/retrieval/<retriever>/*.jsonl` + `runs/<id>/metrics/retrieval_per_question.parquet` |
 | 7 | `answer` | `evaluation/answering.py` + `prompts/rag_answer.md` | questions × 6 setups per corpus (bge-m3's top `top_k` chunks) + the gold passage → `runs/<id>/answers/<corpus>_<setup>.jsonl` (+ `answer_cache.jsonl`) |
-| 8 | `eval` | `evaluation/ragas_eval.py` | samples → per-question Ragas scores |
+| 8 | `eval` | `evaluation/ragas_eval.py` | each corpus's Ragas sample × 7 answer files → `runs/<id>/ragas/per_question.parquet` (+ `details.jsonl`, `cost.json`; the judge's calls in `ragas_cache.jsonl`) |
 | 9 | `report` | `analysis.py` | all per-question scores → tables with bootstrap CIs and paired diffs |
 
 Every stage reads `configs/default.yaml` and writes its own artefacts, so you can re-run any stage without repeating the earlier ones.
@@ -39,7 +39,8 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 
 **Options:**
 - **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
-- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed`, `retrieve` and `answer` have `--corpus` only.
+- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `embed`, `retrieve`, `answer` and `eval` have `--corpus` only.
+- **`--pilot N`** and **`--dry-run`** on `eval`: only the first N questions of each corpus's Ragas sample; or only the cost estimate, with no API call (see [Ragas evaluation](#ragas-evaluation-eval)).
 - **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`) and on `retrieve` (default: `retrieval.embedders`).
 - **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [What `index` builds](#what-index-builds)). On `gen-qa`: delete every Q-A record, of all corpora, and generate again (see [Q-A generation](#q-a-generation-gen-qa)).
 
@@ -113,7 +114,7 @@ src/chunkeval/
 6. **Hybrid models:**
    - a local Qwen model on Ollama (default `qwen3.5:9b-q8_0`) generates the Q-A pairs and the RAG answers
    - local `gpt-oss:20b` on Ollama is the critic
-   - a pinned OpenAI model is the judge, plus one bridge run with gpt-4o for comparison with the previous round
+   - a pinned OpenAI model is the judge (gpt-4.1-mini). There is no second run with gpt-4o to compare with the previous round (decided 2026-10-11: the evaluation focuses on v2 only).
 7. **Metrics:**
    - span-based retrieval metrics: hit@k, span recall@k, MRR, IoU and precision, context tokens
    - the 4 Ragas metrics plus factual correctness
@@ -127,7 +128,7 @@ src/chunkeval/
 4. Start Weaviate with `docker compose up -d` (see the section below), then write `corpus/indexing.py`. Check that object counts match chunk counts and that both named vectors are present.
 5. `qa/generation.py`, then `qa/filtering.py`. Hand-label 50 pairs.
 6. `evaluation/retrieval.py` and `evaluation/retrieval_metrics.py` on all 12 configs × 2 embedders. This step has **no API cost** and is the first decision point.
-7. `evaluation/answering.py` (primary embedder only). Run a Ragas pilot on 20 questions to check cost, then the full run, then the gpt-4o bridge run.
+7. `evaluation/answering.py` (primary embedder only), then `evaluation/ragas_eval.py`: `eval --dry-run` for the cost estimate, `eval --pilot 20` to measure the real cost per question, then the full run.
 8. `analysis.py`, including the embedder robustness table.
 
 ## Before the QA stage: audit the final corpus
@@ -170,7 +171,7 @@ uv run pytest -m "not ollama and not openai and not gpu and not weaviate"   # of
 uv run pytest -m gpu                            # embedding models on the GPU (~10 s): run after changing embedding.py or the models
 uv run pytest -m weaviate                       # the local Weaviate (~15 s): run after changing indexing.py or the Weaviate version
 uv run pytest -m ollama                         # live Ollama tests only: run after upgrading Ollama or changing models
-uv run pytest -m openai                         # OpenAI key + judge snapshots: run before an eval run
+uv run pytest -m openai                         # OpenAI key + judge snapshot (free): run before an eval run
 uv run pytest tests/test_store.py -v            # one file, one line per test
 uv run pytest -k crash                          # tests whose name contains "crash"
 ```
@@ -186,7 +187,7 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_llm.py](tests/test_llm.py), offline | `ChatLLM` setup per provider. `chat` and `chat_many` logic against a fake client: the parameters sent, every `LLMOutputError` case, result order, errors returned in place, concurrency limit, and Ctrl+C cancellation. | nothing |
 | [tests/test_llm.py](tests/test_llm.py), marker `ollama` | Preflight (`check_ollama`), JSON answers from every local role, determinism, resume after an interrupted run, and unloading. Also pins the Ollama behaviour the code relies on: `reasoning_effort="none"` turns Qwen's thinking off, and too-long prompts are truncated silently. | Ollama running, models pulled, `OLLAMA_BASE_URL` |
 | [tests/test_cli.py](tests/test_cli.py) | Every stage in `cli.STAGES` points to a `run` that accepts the options the CLI passes. Argument parsing, and what `main` does around a stage: config saved, log file written, exit codes 1 and 130, missing secrets stop the run before any work, and the Ollama check before and unload after an LLM stage, even when it fails. | nothing |
-| [tests/test_llm.py](tests/test_llm.py), marker `openai` | The API key is valid and the pinned judge snapshots still exist. It only calls a free metadata endpoint, so there's **no cost**. | `OPENAI_API_KEY` |
+| [tests/test_llm.py](tests/test_llm.py), marker `openai` | The API key is valid and the pinned judge snapshot still exists. It only calls a free metadata endpoint, so there's **no cost**. | `OPENAI_API_KEY` |
 | [tests/test_chunking.py](tests/test_chunking.py) | The chunk invariants on all 6 configurations: `text == doc.text[start:end]`, full coverage, `max_tokens`, disjoint spans without overlap, the overlap budget. Also sentence boundaries around tricky abbreviations, the recursive section groups, the shared size rules (`pack`, `overlap_start`), each way `validate_chunks` fails, and the `chunk` stage's output files. When `data/parsed/` exists, the 6 configurations also run on the parsed dev docs with the config sizes. | the bge-m3 tokenizer (~20 MB, downloaded on first use) |
 | [tests/test_embedding.py](tests/test_embedding.py), offline | The vector cache and the `embed` stage with a fake embedder. Each model is loaded once and only when a file needs it. A re-run embeds only changed chunk files: the cache compares content hashes, not mtimes, and a changed query prompt doesn't count. A new model revision re-embeds that model's files. A crashed run resumes. The loader refuses vectors whose chunk_ids differ (order included) or whose settings are stale. The Ollama guard names the loaded models and passes when Ollama is unreachable. | nothing |
 | [tests/test_embedding.py](tests/test_embedding.py), marker `gpu` | Both real models: loaded at the pinned revision; float32 unit-norm output; Qwen3's instruction applied to queries only; two different vector spaces; a 3-passage retrieval sanity check; the same vector with and without padding (pooling + padding side); too-long input raises instead of being truncated; every chunk in `data/chunks/` fits each model's `max_seq_length`. | a CUDA GPU with no Ollama model loaded; the models (~4.5 GB bge-m3, ~1.2 GB Qwen3, downloaded on first use) |
@@ -198,6 +199,7 @@ uv run pytest -k crash                          # tests whose name contains "cra
 | [tests/test_retrieval.py](tests/test_retrieval.py), offline | The oracle's greedy cover (hand-computed) and the random baseline's seeding. Query vectors: encoded with the query prompt, cached, encoded again after a new question or prompt. The `retrieve` stage against a fake embedder and retriever: a file per retriever with ranked hits and no text, then the metrics table (one row per question, retriever and k, unique). A re-run asks nothing; a new query prompt redoes only that embedder; a new question set redoes everything; a mode switch is refused; a question's document without chunks, or chunks cut from another parse, stop the stage. The metrics leave out stale files outside the run's scope, with a warning, and fail on stale files inside it. | nothing |
 | [tests/test_retrieval.py](tests/test_retrieval.py), marker `weaviate` | `WeaviateRetriever` on a `*_pytest` collection: a chunk's own vector finds it first with cosine 1, in the named vector asked; an unknown vector name fails; hybrid with alpha 0 is BM25; a collection built from other chunks, or a missing one, is refused. | Weaviate running, `WEAVIATE_API_KEY` |
 | [tests/test_answering.py](tests/test_answering.py) | The prompt file must contain the abstention phrase the code looks for. The messages: one shared system message, then the passages numbered in rank order with their text only, then the question. `is_abstention` on the phrase (case, markup, an explanation after it), paraphrases alone, and what must stay an answer (a partial answer, a paraphrase followed by facts, "the soil does not contain…"). The `answer` stage on the offline `retrieve` setup against a fake generator: one file per setup and one for the gold passage, each answer holding exactly the top-k chunks it was shown (or its own paragraph) and the evidence flag; the summary counts. A re-run asks nothing, a dropped and restored question asks nothing, another generator setting asks everything; a stale retrieval file stops the stage before any call; an API error writes no answer file and the re-run asks only it; an unusable answer is kept with its error and cached. | nothing |
+| [tests/test_ragas_eval.py](tests/test_ragas_eval.py) | Each of the 5 Ragas metrics run by Ragas itself (`single_turn_ascore`) and by the stage's per-call pipeline on the same fake judge: the same prompts and the same scores. Factual correctness checks claims with faithfulness' prompt, so the two share calls. The judge request (the config's model, temperature and seed) and each call's tokens and cost. The sample is nested and in file order; the text metrics; telemetry is off. The `eval` stage against a fake judge and embedder: a row per question and setup, one of them hand-computed; abstentions scored in code and never sent; no prompt sent twice; a re-run asks nothing, a new answer asks only its response calls; an API error writes nothing and the re-run asks only it; an unreadable output is cached after Ragas' 3 fix-up requests and scores NaN; a dry run and an estimate above the cap ask nothing; the cap stops a run whose estimate was too low; the full run reuses the pilot's calls; a corpus outside `--corpus` comes from the cache alone, or is left out with a warning when a call is missing; stale answers are refused. | nothing |
 | [tests/test_quote_locator.py](tests/test_quote_locator.py) | `locate_quote`, the source of every evidence span. Exact matches, and normalized ones whose offsets still point into the original text: whitespace and paragraph breaks, typographic dashes and quotes, soft hyphens, case, an added full stop, line-break hyphenation. Fuzzy matches only above the threshold, widened to whole words, never against a span shorter than the quote. Only the unit's spans are searched, and too-short quotes are rejected. When `data/parsed/` exists, a random quote from every block of the dev docs, verbatim and with that drift (a quote occurring twice in its block is found at its first occurrence; an invisible character at its edge is left out of the span). | nothing |
 
 **Good to know:**
@@ -542,7 +544,7 @@ uv run chunkeval answer --corpus papers
 
 **Abstentions.** Only when no passage holds any of the information asked for, the generator must reply exactly "The context does not contain the answer." When the passages hold part of it, it gives that part and says nothing about what is missing (a first version that named the missing part backfired on the dev docs; see the prompt's notes). `is_abstention` marks an answer that starts with the phrase, or that is one sentence paraphrasing it ("The provided context does not mention…"); a paraphrase followed by facts counts as an answer. Why this matters:
 - **Ragas 0.2.15 scores an abstention like a wrong answer:** answer relevancy 0 (noncommittal) and factual correctness 0. Its faithfulness comes out at random (NaN, 0 or 1, depending on what the judge extracts). Context precision and recall don't read the answer.
-- **So stage 8 handles them in code** (planned in `ragas_eval.py`): relevancy and factual correctness 0 without asking the judge; faithfulness left out for abstentions and reported next to the abstention rate, plus a view with abstentions = 1. Abstentions are never dropped from every metric, because the paired comparison needs the same questions in every setup.
+- **So stage 8 handles them in code** (see [Ragas evaluation](#ragas-evaluation-eval)): relevancy and factual correctness 0 without asking the judge; faithfulness left out for abstentions and reported next to the abstention rate, plus a view with abstentions = 1. Abstentions are never dropped from every metric, because the paired comparison needs the same questions in every setup.
 - **The summary separates the two kinds of miss** with `evidence_shown` (some passage overlaps the gold evidence, i.e. span_hit at top_k): `abstained_with_evidence` (an over-cautious generator, or evidence split so it looked incomplete) and `answered_without_evidence` (a hallucination risk, unless another document holds the same fact). On the gold passage the abstention rate should be about 0.
 
 **What it writes:**
@@ -562,11 +564,91 @@ uv run chunkeval answer --corpus papers
   Three of the seven are in the labelling sample (paper_74, paper_93, report_123); check the rest when labelling. On the full corpus, list every question the gold passage abstains on for the audit.
 - **The first version of the prompt** asked partial answers to name what was missing. It abstained less (42 in all, 5 on the gold passage), but 20 answers carried "the context does not say…" sentences, and several abstentions opened with the phrase, then gave the facts anyway. The prompt's notes have the details.
 
+## Ragas evaluation (`eval`)
+
+```bash
+uv run chunkeval eval --dry-run          # the cost of every judge call not cached yet: no API call, nothing written
+uv run chunkeval eval --pilot 20         # the first 20 questions of each corpus's sample: the real cost per question
+uv run chunkeval eval                    # the whole sample; asks the judge only what isn't cached
+```
+
+The judge is OpenAI's `gpt-4.1-mini-2025-04-14` (`llm.judge`), so this is the only stage that costs money. The previous round's Ragas run reportedly cost almost $900, so the stage is built to never pay for a call twice and never to spend more than `ragas.max_cost_usd`.
+
+**What it scores** (`evaluation/ragas_eval.py`): for each corpus, `ragas.sample_per_corpus` questions of `filtered.jsonl` (all of them when there are fewer), in each of its 7 answer files: the 6 setups and the gold passage. Every setup is scored on the same questions, so the comparisons are paired.
+- **The sample** is a seeded hash rank, not a shuffle: a smaller sample is the start of a larger one. The pilot's questions are part of the full run, and raising `sample_per_corpus` only adds questions.
+- **300 is a cost guardrail** (decided 2026-10-12), at ~$0.04 per question across its 7 setups. The dev docs (15 and 20 questions) are scored in full. On the final corpus (~320 and ~400 questions expected) it would sample both corpora, without stratification (see [Future work](#future-work)).
+- **The Ragas columns:** `user_input` = the question, `retrieved_contexts` = the passages the generator read, `response` = the RAG answer, `reference` = the gold answer. The old script used the gold answer as `response` and the source chunk as `reference`.
+
+**The metrics.** Ragas returns more than the score on the way, and everything is kept, since it costs nothing extra (decided 2026-10-11):
+
+| Column | What it is |
+|---|---|
+| `context_precision` | Per retrieved chunk, the judge says whether it helps reach the gold answer; average precision over the ranks. `cp_verdicts` keeps the verdicts by rank (e.g. `10010`), `cp_useful` their sum. |
+| `context_recall` | The gold answer's sentences the judge attributes to the contexts (`cr_sentences`, `cr_attributed`). |
+| `faithfulness` | The response's statements the contexts support (`faith_statements`, `faith_supported`). |
+| `answer_relevancy` | Cosine (bge-m3) between the question and a question the judge generates back from the response; 0 when the judge calls the response noncommittal (`rr_cosine`, `rr_noncommittal`). |
+| `factual_correctness` | Ragas' f1, rounded to 2 decimals as Ragas does: the response's claims checked against the gold answer, and the gold answer's against the response. Ragas' defaults: mode f1, atomicity and coverage "low". |
+| `fc_precision`, `fc_recall`, `fc_f1` | From the same verdicts: the response's claims the gold answer supports; the gold answer's claims the response covers; their F1. With the claim counts (`fc_response_claims`, …). |
+| `fc_recall_ragas` | The recall inside Ragas' f1. It divides supported *response* claims by those plus uncovered *gold* claims, so it is inflated when the response has more claims than the gold answer, as RAG answers do (35–43 words against 22 on the dev docs). Compare it with `fc_recall`. |
+| `rouge_l`, `token_f1`, `answer_similarity` | Judge-free, response against the gold answer: ROUGE-L F, SQuAD token F1, bge-m3 cosine. A sanity check on factual correctness. |
+
+Each row also carries `abstained`, `answer_error`, `evidence_shown`, `response_words`, `n_contexts` and the question's attributes (`doc_id`, `question_type`, `kind`, `section`, evidence size) for the breakdowns.
+
+**Factual correctness is reported both ways** (decided 2026-10-12), each with what it measures:
+- **`factual_correctness`** is Ragas' standard score, comparable with other Ragas reports. It counts as wrong any true claim the gold answer doesn't state, such as the question's own wording, the source's name or an extra correct detail.
+- **`fc_recall`** asks "is the right answer in it?": the share of the gold answer's claims the answer contains. `fc_precision` asks "does it say only that?", and `fc_f1` combines the two.
+
+**For stage 9:** what the report must do with this table is written in [analysis.py](src/chunkeval/analysis.py): the abstention views, the gold passage as the ceiling and as a check on the judge, the join with the retrieval table, and the questions to read by hand.
+
+**Abstentions** (decided 2026-10-11, see [RAG answers](#rag-answers-answer)): the response metrics don't ask the judge. Relevancy, every factual-correctness score and the three text metrics are 0, which is what Ragas would give; faithfulness is NaN, to be reported next to the abstention rate, with a view where abstentions count as 1. Context precision and recall don't read the response, so they are scored as usual. An answer with an `error` has its response metrics NaN.
+
+**How Ragas is called.** With Ragas' own prompts, output parsers and scoring code, but one prompt at a time instead of through `ragas.evaluate`:
+- **Every judge call is cached** in `ragas_cache.jsonl` as soon as it returns, keyed by its rendered prompt and the judge settings. A re-run asks only what is new, a crash loses only the calls in flight, and identical calls are asked once: the same chunk judged for the same question in several setups, the same answer in several setups, the gold answer's claims (once per question, not once per setup).
+- **API errors are not unusable outputs.** `ragas.evaluate` turns both into NaN. Here an API error caches nothing and stops the stage before anything is written; the re-run asks only it. An output Ragas can't parse, even after its 3 fix-up requests, is cached with its error (at temperature 0 it would fail again) and makes that metric NaN.
+- **The judge client** sends the config's model, temperature and seed. It replaces Ragas' LangchainLLMWrapper, which sets the temperature and `n` on a shared client before each call, so concurrent calls could go out with each other's settings.
+- **Checked against Ragas:** a test runs each of the 5 metrics through Ragas itself and through the stage on the same fake judge, and gets the same prompts and the same scores.
+- **Two departures from Ragas' defaults,** both because they would only cost money: relevancy generates 1 question, not 3 (in 0.2.15 those are 3 separate calls at temperature ~0, i.e. the same question three times), and a claim check with no claims isn't sent.
+
+**The cost guard:**
+- **Before any call,** the stage counts the input tokens of every call it doesn't have cached (the prompts exactly as they will be sent) and estimates the output tokens: from the cache's mean per prompt once it has 5 calls of a kind, else a fixed guess. It logs the estimate per prompt and **refuses to start above `ragas.max_cost_usd`** (5 for now). `--dry-run` stops after the estimate.
+- **While running,** it stops asking once the new spend reaches the cap. What was paid is cached, nothing is written, and the re-run continues.
+- **Prices** are in `ragas.prices`, per judge model; a config whose OpenAI judge has no price fails at load.
+- **The bill is at most what is reported:** prompt-cache hits are priced as full input. In practice there are none: every Ragas prompt's fixed part is under OpenAI's 1,024-token caching minimum.
+
+**What it writes:**
+- **`runs/<run_id>/ragas/per_question.parquet`:** one row per (question_id, corpus, setup). `method` and `overlap` are empty for the gold passage.
+- **`runs/<run_id>/ragas/details.jsonl`:** per row, the texts and everything the judge returned: each chunk's verdict and reason, the attributed sentences, the statements and claims with their verdicts, the generated question. This is where to read why a score is what it is.
+- **`runs/<run_id>/ragas/cost.json`:** calls, tokens and USD of this run (with its estimate) and of all the calls the table rests on, by prompt, plus the cost per question across all setups, to size `sample_per_corpus`.
+- **`runs/<run_id>/ragas_cache.jsonl`:** every judge call with its output or error, model, tokens and cost.
+- **`runs/<run_id>/ragas_summary.json`:** per corpus and setup, each metric's mean and NaN count; the summary lines are also logged.
+- **A pilot** writes the same files, covering only its questions; the full run rewrites them. The table covers every corpus with questions: a corpus outside `--corpus` comes from the cache only, and is left out with a warning if a call is missing.
+
+**On the dev docs** (35 questions, 2026-10-11):
+- **Calls and cost:** 245 rows need 2,064 judge calls, against 2,660 if identical calls were asked again (22% fewer). Context precision is about 40% of the cost (909 calls, one per chunk).
+- **The pilot** (`--pilot 2`: 2 questions per corpus, 28 rows): 252 calls in 2 min 55 s for **$0.165**, 10% above its $0.149 estimate. Every output parsed, with no fix-up requests and no prompt-cache hits.
+  - **Output tokens per call,** now used by the estimate: context precision 66, context recall 108, statements 118, claims 100, NLI checks 312, question 30.
+- **The full dev run** (2026-10-12): the rest was 1,809 calls in 20 min for $1.124, against a $1.177 estimate. The table's 2,061 calls cost **$1.29** in all: $0.037 per question across its 7 setups. Every output parsed again.
+  - **The full corpus,** at 300 questions per corpus, would be ~$22 and ~35,000 calls, about 6 h at `max_workers: 2` (~1.6 calls/s).
+- **Ragas' factual correctness scores correct answers 0** when they restate the question or add a true detail, because the judge checks the answer's claims against the gold answer alone. On 2 of the pilot's reports questions, every retrieved setup scored 0:
+  - an answer listing exactly the gold answer's six partners had every claim phrased "…provided climate change resources to CABEI's member countries", wording from the question that the gold answer lacks;
+  - an answer correctly attributed a figure to António Guterres, whom the gold answer doesn't name.
+
+  `fc_recall` was 1.0 for both, since every gold claim was in the answer. Ragas' f1 is 0 because its recall counts answer claims, of which none were "supported".
+- **On the whole dev set,** 143 of the 190 answered rows contain every gold claim (`fc_recall` 1), yet their mean Ragas f1 is only 0.60, and 18 of them (6 questions) score 0. The answers hold 4.2 claims on average, the gold answers 2.7. Over the answered rows: Ragas f1 0.54, `fc_precision` 0.47, `fc_recall` 0.83. Hence both versions are reported (see above).
+- **The judge is consistent with the spans:**
+  - The gold passage scores exactly 1.000 on context precision and recall in both corpora: no attribution error.
+  - On the retrieved setups, "some chunk useful" agrees with stage 6's `span_hit@5` in 91% of the rows.
+  - Most disagreements are retrievals that do hold the answer: in 15 rows (4 questions) the judge found a useful chunk although none overlaps the gold evidence (context recall 0.54 there). The fact also appears elsewhere: 20 such chunks from the same document, 8 from report_16, the near-duplicate of report_15. The span metrics count those as misses.
+- **Which metrics respond to retrieval** (answered rows, gold passage vs the setups):
+  - **Factual correctness does:** `fc_recall` 0.90 vs 0.82, and 0.86 with the evidence shown vs 0.06 without.
+  - **Faithfulness and relevancy don't:** faithfulness 0.96 vs 0.94, near its ceiling; relevancy 0.79 vs 0.81, as flat as in the previous round.
+- **No chunker ranking:** the setups differ by a few questions, as in retrieval (the paired CIs are stage 9's).
+
 ## Dependencies
 - **Installed with uv:** all the pipeline libraries, plus pytest in the dev group, plus `chunkeval` itself in editable mode.
   - **On a fresh clone,** run `uv sync`.
   - **On the existing `.venv`,** use `uv sync --inexact`. It also holds packages that aren't in the lockfile (CUDA 12 libraries left over from the torch upgrade), and a plain `uv sync` would uninstall them.
-- **ragas** is still 0.2.15. Upgrading changes its API, so read the migration notes first.
+- **ragas** is still 0.2.15. Upgrading changes its API, so read the migration notes first. `eval` uses its prompts, parsers and scoring code directly, and caches every judge call under the Ragas version, so an upgrade re-asks (and re-pays) every call; `tests/test_ragas_eval.py` checks the stage still matches Ragas' own metrics. Ragas 0.2.x sends usage data to its developers unless `RAGAS_DO_NOT_TRACK` is set: `ragas_eval.py` sets it before importing ragas.
 - **Ollama** serves the local LLMs. It's a system service, not a Python package; the code reaches it with the `openai` client.
 
 ## Future work
@@ -590,6 +672,16 @@ uv run chunkeval answer --corpus papers
 - **Limits:** a 9B model's citations are approximate (wrong block, missing ones), so they are a diagnostic, not a headline metric; check ~20 by hand first. A prompt change re-asks every answer.
 
 **Random-context check of the abstention rule.** Not implemented (decided 2026-10-11). Answer each question once more from `top_k` random chunks (the `random` retrieval files of one setup, ~35 calls on the dev docs) and count abstentions: nearly all should abstain. If many don't, the generator answers from irrelevant text and rule 7 of `prompts/rag_answer.md` isn't working. A cheap check of the prompt, best run on the dev docs after any change to it.
+
+**A stratified Ragas sample.** Not implemented (2026-10-12). When a corpus has more questions than `ragas.sample_per_corpus`, `eval` scores a seeded random subset (`ragas_sample`), so by chance it can over- or under-represent a document, a question type or the two-span pairs. A stratified draw would keep the question set's mix, e.g. proportionally per document and question type, while staying nested (a pilot is still the start of the full sample). It matters only if the final corpus has well over 300 questions per corpus. The alternative is to score every question: about $0.04 each, ~$29 for ~720.
+
+**Models on our own servers.** Not implemented (2026-10-12; to revisit once the server details are known). Any role (generator, critic, judge) could use a model served behind the OpenAI API on one of our servers (vLLM, TGI, …). Today only two providers exist: `openai` always goes to api.openai.com, and `ollama` also calls Ollama-only endpoints for its checks and model digest. It needs:
+- a third `provider` with its `base_url` in the config and an API key in `.env` (in `Secrets` and `require_secrets`), with no Ollama checks;
+- `ChatLLM` (`core/llm.py`) and `ragas_eval.judge_client` / `judge_settings` built from them, and `ragas.prices` optional for it (cost 0);
+- a provenance record instead of the Ollama digest: the weights can't be fingerprinted, so the server's model version must be pinned on its side and recorded in the config;
+- checking what the server supports: token usage in its replies (the cost guard and token counts need it), `seed`, `reasoning_effort` and JSON-schema output.
+
+As a judge, avoid the Qwen family, which wrote the answers.
 
 **Models partly on the CPU.** At the moment, `check_ollama` only logs a warning when a model isn't 100% on the GPU. `test_live_check_ollama` hard-codes that both generators must be 100%. There are two situations to handle:
 - **Deliberate:** a MoE generator (only about 3B parameters active per token) is partly on the CPU by design and stays usable.

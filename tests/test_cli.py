@@ -58,7 +58,8 @@ def test_stage_targets_accept_the_cli_options(command, cfg):
     for required parameters) — before anyone runs the stage for real.
     """
     stage = cli.STAGES[command]
-    options = {"corpora": ["papers"], "limit": 1, "embedders": ["bge_m3"], "recreate": True}
+    options = {"corpora": ["papers"], "limit": 1, "embedders": ["bge_m3"], "recreate": True, "pilot": 2,
+               "dry_run": True}
     for target in stage.targets:
         function = cli.resolve(target)
         inspect.signature(function).bind(cfg, Secrets(), **{o: options[o] for o in stage.options})

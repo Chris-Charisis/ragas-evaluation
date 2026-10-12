@@ -148,7 +148,6 @@ class LLM(StrictConfig):
     qa_critic: LLMModel
     rag_generator: LLMModel
     judge: LLMModel
-    bridge_judge: LLMModel
 
 # Question types the Q-A generator can be asked for (prompts/qa_generation.md defines each one);
 # also the enum of qa.generation.QA_JSON_SCHEMA.
@@ -192,13 +191,18 @@ class Retrieval(StrictConfig):
             raise ValueError(f"retrieval.k_values has a repeated value: {self.k_values}")
         return self
 
+class Price(StrictConfig):
+    """USD per 1M tokens."""
+    input: float = Field(ge=0)
+    output: float = Field(ge=0)
+
 class Ragas(StrictConfig):
-    embeddings_model: str
     sample_per_corpus: int = Field(gt=0)
     max_workers: int = Field(ge=1)
     timeout: int = Field(gt=0)
     max_retries: int = Field(ge=0)
-    max_wait: int = Field(ge=0)
+    max_cost_usd: float = Field(gt=0)
+    prices: dict[str, Price] = {}        # by judge model; an OpenAI judge must have one
 
 class Analysis(StrictConfig):
     bootstrap_iterations: int = Field(gt=0)
@@ -258,6 +262,12 @@ class Config(StrictConfig):
         unknown = [c for c in self.parsing.body if c not in self.paths.corpora]
         if unknown:
             raise ValueError(f"parsing.body {unknown} not in paths.corpora: {list(self.paths.corpora)}")
+
+        # `eval` estimates and caps the judge's cost, so a paid judge needs its price.
+        judge = self.llm.judge
+        if judge.provider == "openai" and judge.model not in self.ragas.prices:
+            raise ValueError(f"ragas.prices has no price for the judge {judge.model!r}: add it (USD per 1M "
+                             f"input and output tokens), so `eval` can estimate and cap its cost")
         return self
 
     @model_validator(mode="after")
