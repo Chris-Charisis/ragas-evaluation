@@ -22,7 +22,7 @@ after Holm: no difference shown.
 Document-level intervals (decided 2026-10-12). The bootstrap above redraws QUESTIONS, as if each were
 an independent draw. Questions of one document share its quirks (garbled OCR, a near-duplicate
 document), so they fail or succeed together, and an effect carried by one or two documents looks
-more certain than it is (dev: 4 of the 7 papers questions behind recursive_no_overlap's +0.17
+more certain than it is (dev: 4 of the 7 papers questions behind section_no_overlap's +0.17
 fc_recall are from paper_4). The paired comparisons therefore also get a CI that redraws whole
 DOCUMENTS with all their questions; a difference whose question-level CI excludes 0 but whose
 document-level CI doesn't is flagged `few_docs` ("rests on a few documents"). It needs many

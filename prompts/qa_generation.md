@@ -1,6 +1,6 @@
 # Q-A generation prompt
 
-Used by `chunkeval.qa.generation.build_messages` and sent to the local generator (cfg `llm.qa_generator`, default `qwen3.5:9b-q8_0`, thinking off) as chat messages. Everything above the first section line is notes and is never sent.
+Used by `chunkeval.qa.generation.build_messages` and sent to the local generator (cfg `llm.qa_generator`, default `gemma4:12b-it-q8_0` since 2026-10-19, as the all-GPU tag `gemma4-allgpu:12b-it-q8_0`; `qwen3.5:9b-q8_0` on the dev docs; thinking off) as chat messages. Everything above the first section line is notes and is never sent.
 
 **Sections** (a line `## <name>` starts each one; `load_prompt` checks that exactly these exist and that each uses exactly its placeholders):
 - `system`: sent as is. It is the same for every call, so Ollama can reuse its cached prefix.
@@ -15,7 +15,8 @@ In the template sections, a literal dollar sign must be written `$$`.
 - **Verbatim quotes.** `locate_quote` turns them into the evidence spans, and a pair whose quote can't be found is dropped.
 - **Corpus-level specificity.** The corpus has hundreds of documents, so a question needs a distinguishing entity to have one right answer.
 - **One question per call.** Several questions per unit come out as near-duplicates, which the dedup step then removes.
-- **The output format is spelled out exactly.** On Ollama 0.30.4, Qwen3.5 with thinking off ignores the JSON schema it is sent (see `ChatLLM.chat`, point 3). `chat` still validates every answer against `QA_JSON_SCHEMA`, so a vague description turns directly into lost items.
+- **The output format is spelled out exactly.** On Ollama 0.30.4, Qwen3.5 with thinking off ignores the JSON schema it is sent (see `ChatLLM.chat`, point 3). `chat` still validates every answer against `QA_JSON_SCHEMA`, so a vague description turns directly into lost items. Gemma 4 on Ollama 0.40.6 follows the schema anyway (no `bad_output` in 97 dev units); the spelled-out format stays, so the prompt works with either model.
+- **Reasoning questions combine two sentences** (2026-10-19). Gemma 4 answered 84 of 93 dev pairs from a single sentence (Qwen: 38 of 84), and since the sentence and recursive chunkers never cut inside a sentence, its evidence crossed a chunk boundary for only 0–2% of the kept questions with them (Qwen: 6–23%), which leaves the chunkers little to differ on. The earlier "usually linking two statements" was read as optional. A reasoning skip is asked again as `factoid` (see `generation.py`). Result on the same 97 units: reasoning pairs with 2+ spans 6/25 → 13/22, same yield, but the two sentences are adjacent, so the boundary share for sentence/recursive stayed at 0–2%.
 - **The example is invented,** not taken from a document of the evaluation set.
 - **The section path is shown as context only.** Unit spans hold paragraphs, never headings, so a quoted heading is never located.
 
@@ -36,7 +37,7 @@ The answer:
 - Every claim in it is supported by the evidence quotes. Add nothing else.
 
 The evidence quotes:
-- 1 to 3 quotes that together contain every fact in the answer.
+- 1 to 3 quotes that together contain every fact in the answer. A reasoning question has at least 2, from different sentences.
 - Copy each quote EXACTLY from the passage, character for character. Do not paraphrase, do not shorten with "...", do not fix typos, do not change numbers or capitalisation.
 - Each quote is one contiguous piece of the passage of at least 5 words, usually a whole sentence.
 - Quote only the passage text, never the document title or the section.
@@ -45,7 +46,7 @@ Question types:
 - factoid: asks for a specific fact: what, which, who, where or when (a variety, an organisation, a place, a method, an event).
 - numeric: the answer is a number stated in the passage, with its unit (a quantity, percentage, rate, count or year).
 - definition: asks what a term, concept, method or programme is, as the passage defines or describes it.
-- reasoning: asks why or how: a cause, effect, mechanism or comparison that the passage states explicitly, usually linking two statements.
+- reasoning: asks why or how: a cause, effect, mechanism or comparison that the passage states explicitly. Its answer must combine statements from at least two different sentences of the passage, for example a cause in one sentence and its effect in another, or two things compared in separate sentences; quote each of those sentences. If the passage only answers why or how within a single sentence, skip.
 
 Write a question of the type you are asked for. Skip instead when the passage has nothing that fits that type, or nothing worth asking about: addresses, contact lists, copyright notices, lists of names, garbled or unreadable text.
 

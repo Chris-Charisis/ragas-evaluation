@@ -18,9 +18,11 @@ What is answered, per corpus, for every question of filtered.jsonl:
     generator's (and the judge's) own error from what retrieval costs. Not the retrieval `oracle`
     (each setup's chunks that cover the evidence): stage 6 already measures that ceiling for free.
 
-The prompt (prompts/rag_answer.md) shows the chunk TEXT only: no document title or section path,
-so every chunker gets the same kind of input, and the contexts Ragas judges faithfulness against
-are exactly what the generator read. Its notes explain the other rules.
+The prompt (prompts/rag_answer.md) shows each passage's text with its document's title, but no
+section path, so every chunker gets the same kind of input (chunk text only until 2026-10-21: the
+generator then abstained on questions naming a setting the passage doesn't repeat, see the prompt's
+notes). `Answer.contexts` holds the same title line (`context`), so the contexts Ragas judges
+faithfulness against are exactly what the generator read. Its notes explain the other rules.
 
 Abstention: only when no passage holds any of the information asked for, the prompt asks for exactly
 ABSTENTION_PHRASE; when the passages hold part of it, for that part, with nothing on what is missing.
@@ -29,8 +31,8 @@ ABSTENTION_PHRASE; when the passages hold part of it, for that part, with nothin
 (see ragas_eval.py).
 
 Re-runs: the generator's answers are cached in answer_cache.jsonl, keyed by a hash of everything
-that decides them (`answer_key`: the messages, the generator's model, settings and Ollama digest,
-the seed, ANSWER_VERSION). A re-run asks only what is new: new questions, a question shown other
+that decides them (`answer_key`: the messages with their titles, the generator's model, settings and
+Ollama digest, the seed, ANSWER_VERSION). A re-run asks only what is new: new questions, a question shown other
 chunks, or everything after a prompt or generator change. The answer files are rewritten from the
 cache every time, so they always match the current questions and retrieval.
 
@@ -85,12 +87,12 @@ PROMPT_PATH = REPO_ROOT / "prompts" / "rag_answer.md"
 PROMPT_SECTIONS: dict[str, set[str] | None] = {
     "system": None,
     "user": {"context", "question"},
-    "passage": {"number", "text"},
+    "passage": {"number", "title", "text"},
 }
 
 # Bump when a change in this module changes what the generator is asked or how its answer is read:
-# every cached answer then misses its key and is asked again.
-ANSWER_VERSION = 1
+# every cached answer then misses its key and is asked again. 2: passages with their document's title.
+ANSWER_VERSION = 2
 
 
 @dataclass
@@ -98,7 +100,13 @@ class Shown:
     """What the generator is shown for one question in one setup."""
     chunk_ids: list[str]      # in rank order; empty for the gold passage
     texts: list[str]          # the passages, in that order
+    titles: list[str]         # each passage's document title
     evidence: bool            # some passage overlaps the gold evidence (span_hit at top_k); gold: always
+
+    @property
+    def passages(self) -> list[tuple[str, str]]:
+        """(title, text) of each passage, in rank order."""
+        return list(zip(self.titles, self.texts))
 
 
 @dataclass
@@ -108,7 +116,7 @@ class Answer:
     corpus: str
     setup: str                # "<method>_<ovl>" or "gold_passage"
     response: str             # Ragas `response`; "" when `error`
-    contexts: list[str]       # Ragas `retrieved_contexts`: exactly the passages the generator read
+    contexts: list[str]       # Ragas `retrieved_contexts`: exactly the passages the generator read (`context`)
     chunk_ids: list[str]      # their chunk ids, in rank order (empty for the gold passage)
     evidence_shown: bool      # some passage overlaps the gold evidence
     abstained: bool           # `is_abstention(response)`
@@ -131,18 +139,24 @@ def load_prompt(path: Path = PROMPT_PATH) -> dict[str, str]:
     return sections
 
 
-def build_messages(question: str, passages: list[str]) -> list[dict[str, str]]:
+def build_messages(question: str, passages: list[tuple[str, str]]) -> list[dict[str, str]]:
     """System + user chat messages for one question, from prompts/rag_answer.md.
 
     The system message holds every rule, so it is the same for every call; the user message holds
-    the passages, numbered in the order given (rank order), with their text only, then the question.
+    the passages, (title, text) pairs numbered in the order given (rank order), then the question.
     """
     prompt = load_prompt()
-    context = "\n\n".join(Template(prompt["passage"]).substitute(number=i, text=text)
-                          for i, text in enumerate(passages, start=1))
+    context = "\n\n".join(Template(prompt["passage"]).substitute(number=i, title=title, text=text)
+                          for i, (title, text) in enumerate(passages, start=1))
     user = Template(prompt["user"]).substitute(context=context, question=question)
     return [{"role": "system", "content": prompt["system"]},
             {"role": "user", "content": user.strip()}]
+
+
+def context(title: str, text: str) -> str:
+    """One passage as Ragas reads it (`Answer.contexts`): the title line of the prompt's `passage`
+    section, then the text; without the number and quotes, which only separate passages there."""
+    return f"Document: {title}\n{text}"
 
 
 # --- abstentions ----------------------------------------------------------------------------------
@@ -185,10 +199,28 @@ def is_abstention(response: str) -> bool:
 
 # --- what each question is shown ------------------------------------------------------------------
 
-def retrieved(cfg: Config, corpus: str, variant: str, pairs: list[QAPair]) -> tuple[dict[str, Shown], dict[str, Any]]:
+def doc_titles(cfg: Config, corpus: str) -> dict[str, str]:
+    """doc_id -> title of every parsed document of `corpus` (`parse` applied parsing.title_overrides):
+    a retrieved chunk can come from any document, also one without questions."""
+    titles = {}
+    for path in sorted((cfg.paths.data_dir / "parsed" / corpus).glob("*.json")):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        titles[doc["doc_id"]] = doc["title"]
+    return titles
+
+
+def titles_sha256(titles: dict[str, str]) -> str:
+    """sha256 of `doc_titles`, recorded with the answers: a retitled document changes what the
+    generator is shown, and the chunk and retrieval hashes don't see it (chunks hold text only)."""
+    return hashlib.sha256(json.dumps(titles, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def retrieved(cfg: Config, corpus: str, variant: str, pairs: list[QAPair],
+              titles: dict[str, str]) -> tuple[dict[str, Shown], dict[str, Any]]:
     """What each question of `pairs` (the corpus's whole question set) is shown in one setup: the
     top_k chunks the primary embedder retrieved, in rank order, with their text from the chunk
-    file. Also returns the retrieval file's provenance, recorded with the answers.
+    file and their document's title from `titles` (`doc_titles`). Also returns the retrieval
+    file's provenance, recorded with the answers.
 
     Refuses a retrieval file that is missing or stale (retrieved before the questions, the chunks or
     the query settings changed): its chunk ids could then point to other text than it ranked."""
@@ -205,14 +237,16 @@ def retrieved(cfg: Config, corpus: str, variant: str, pairs: list[QAPair]) -> tu
     for qa in pairs:
         top = hits[qa.id][:k]
         shown[qa.id] = Shown([h.chunk_id for h in top], [text[h.chunk_id] for h in top],
-                             bool(question_metrics(qa, top, k)["span_hit"]))
+                             [titles[h.doc_id] for h in top], bool(question_metrics(qa, top, k)["span_hit"]))
     return shown, expected
 
 
 def gold_passage(qa: QAPair, doc: "CanonicalDoc") -> Shown:
     """The passage `qa` was generated from: its unit's spans as the generator saw them (one, or A and
-    B of a two-span unit), each one passage, without the title and section path the generator had."""
-    return Shown([], [doc.text[start:end] for start, end in qa.meta["unit_spans"]], True)
+    B of a two-span unit), each one passage with the document's title, without the section path the
+    generator had."""
+    spans = qa.meta["unit_spans"]
+    return Shown([], [doc.text[start:end] for start, end in spans], [doc.title] * len(spans), True)
 
 
 # --- the generator --------------------------------------------------------------------------------
@@ -343,9 +377,11 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
     setups: dict[tuple[str, str], tuple[dict[str, Shown], dict[str, Any]]] = {}
     for corpus in corpora:
         pairs = questions[corpus]
-        base = {"version": ANSWER_VERSION, "corpus": corpus, "questions_sha256": questions_sha256(pairs)}
+        titles = doc_titles(cfg, corpus)
+        base = {"version": ANSWER_VERSION, "corpus": corpus, "questions_sha256": questions_sha256(pairs),
+                "titles_sha256": titles_sha256(titles)}
         for _, _, variant in variants(cfg):
-            shown, retrieval = retrieved(cfg, corpus, variant, pairs)
+            shown, retrieval = retrieved(cfg, corpus, variant, pairs, titles)
             setups[(corpus, variant)] = shown, {**base, "setup": variant, "top_k": k, "retrieval": retrieval}
         shown = {qa.id: gold_passage(qa, docs[(corpus, qa.doc_id)]) for qa in pairs}
         setups[(corpus, GOLD_PASSAGE)] = shown, {**base, "setup": GOLD_PASSAGE, "top_k": None, "retrieval": None}
@@ -360,7 +396,7 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
     todo: dict[str, tuple[str, str, list[dict[str, str]]]] = {}
     for (corpus, setup), (shown, _) in setups.items():
         for qa in questions[corpus]:
-            messages = build_messages(qa.question, shown[qa.id].texts)
+            messages = build_messages(qa.question, shown[qa.id].passages)
             key = keys[(corpus, setup, qa.id)] = answer_key(messages, generator)
             if key not in cache and key not in todo:
                 todo[key] = (qa.id, setup, messages)
@@ -380,7 +416,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
         for qa in questions[corpus]:
             r, s = cache[keys[(corpus, setup, qa.id)]], shown[qa.id]
             rows.append(Answer(question_id=qa.id, corpus=corpus, setup=setup, response=r["response"],
-                               contexts=s.texts, chunk_ids=s.chunk_ids, evidence_shown=s.evidence,
+                               contexts=[context(title, text) for title, text in s.passages],
+                               chunk_ids=s.chunk_ids, evidence_shown=s.evidence,
                                abstained=r["error"] is None and is_abstention(r["response"]), error=r["error"],
                                model=r["model"], prompt_tokens=r["prompt_tokens"],
                                completion_tokens=r["completion_tokens"]))

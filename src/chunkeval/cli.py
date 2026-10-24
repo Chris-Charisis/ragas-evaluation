@@ -47,6 +47,9 @@ class Stage:
 STAGES: dict[str, Stage] = {
     "parse": Stage("Stage 1: PDFs -> CanonicalDoc JSON (Docling)",
                    ("chunkeval.corpus.parsing:run",), ("corpora", "limit")),
+    "audit": Stage("Stage 1b: audit the parsed corpus before chunking (OCR, body, titles, garbled text, "
+                   "languages, duplicates, size); flags only, changes nothing",
+                   ("chunkeval.corpus.audit:run",), ("corpora",)),
     "chunk": Stage("Stage 2: CanonicalDoc -> chunks for every (method, overlap) + size stats",
                    ("chunkeval.corpus.chunking:run",), ("corpora", "limit")),
     "embed": Stage("Stage 2b: embed chunks with bge-m3 (primary) and Qwen3-Embedding (secondary), cached (GPU)",

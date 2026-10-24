@@ -2,7 +2,7 @@
 
 Most tests chunk `tiny_doc` (conftest) with small sizes (target 40, max 80 tokens), so every rule
 fires on text small enough to check by hand. `test_parsed_docs` runs the 6 configurations with the
-config sizes on the parsed dev docs in data/parsed/ (skipped until `chunkeval parse` has run).
+config sizes on the first parsed docs in data/parsed/ (skipped until `chunkeval parse` has run).
 `pack` and `overlap_start` are pure functions of unit sizes and are tested on their own.
 """
 import dataclasses
@@ -277,7 +277,7 @@ def test_run_without_parsed_docs(cfg, counter, tmp_path):
         run(cfg, None, corpora=["papers"])
 
 
-# --- the real dev docs, config sizes --------------------------------------------------------------
+# --- the parsed docs, config sizes ---------------------------------------------------------------
 
 def parsed_docs(per_corpus=2):
     """The first parsed docs of each corpus (at most `per_corpus`, so the test stays fast)."""

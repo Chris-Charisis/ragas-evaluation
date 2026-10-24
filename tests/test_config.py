@@ -34,7 +34,7 @@ def test_reasoning_effort_parsed(cfg):
     assert cfg.llm.qa_generator.reasoning_effort == "none"
     assert cfg.llm.rag_generator.reasoning_effort == "none"
     assert cfg.llm.qa_critic.reasoning_effort == "low"
-    assert cfg.llm.judge.reasoning_effort is None        # non-reasoning model: never sent
+    assert cfg.llm.judge.reasoning_effort == "none"      # gpt-6-luna takes temperature 0 only with "none"
 
 
 # --------------------------------------------------------------------------------------

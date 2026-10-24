@@ -5,7 +5,8 @@ filtered.jsonl, or `--pilot N`) in every answer file of stage 7: the 6 (method, 
 gold passage, the same questions in each (paired data). The Ragas columns (the old script,
 ragas_evaluation.py:470-486, used the gold answer as response and the source chunk as reference):
     user_input          <- the question
-    retrieved_contexts  <- Answer.contexts: exactly the passages the generator read, in rank order
+    retrieved_contexts  <- Answer.contexts: exactly the passages the generator read (document title line,
+                           then the text), in rank order
     response            <- Answer.response, the RAG answer of THIS setup
     reference           <- the gold answer (QAPair.answer)
 
@@ -611,22 +612,24 @@ def setups(cfg: Config) -> list[tuple[str | None, bool | None, str]]:
 
 def load_corpus_answers(cfg: Config, corpus: str, pairs: list[QAPair]) -> dict[str, dict[str, Answer]]:
     """setup -> question_id -> Answer for a corpus's whole question set `pairs`. Refuses an answer file
-    that is missing or was made for other questions, retrieval, top_k or answer prompt than the current
-    ones (what `chunkeval answer` would redo), so no row scores an answer to something else."""
+    that is missing or was made for other questions, retrieval, top_k, document titles or answer prompt
+    than the current ones (what `chunkeval answer` would redo), so no row scores an answer to something else."""
     prompt_sha = hashlib.sha256(answering.PROMPT_PATH.read_bytes()).hexdigest()
+    titles_sha = answering.titles_sha256(answering.doc_titles(cfg, corpus))
     by_setup = {}
     for method, overlap, setup in setups(cfg):
         path = answer_path(cfg, corpus, setup)
         stored = stored_provenance(path)
         current = stored is not None and stored.get("version") == answering.ANSWER_VERSION and \
-            stored.get("questions_sha256") == questions_sha256(pairs) and stored.get("prompt_sha256") == prompt_sha
+            stored.get("questions_sha256") == questions_sha256(pairs) and stored.get("prompt_sha256") == prompt_sha \
+            and stored.get("titles_sha256") == titles_sha
         if current and setup != GOLD_PASSAGE:
             sha = variant_chunks(cfg, corpus, setup)[1]["chunks_sha256"]
             current = stored["top_k"] == cfg.retrieval.top_k and stored["retrieval"] == file_provenance(
                 cfg, cfg.embedding.primary, corpus, setup, sha, pairs)
         if not current:
-            raise RuntimeError(f"{path} is missing or older than the current questions, retrieval or answer "
-                               f"prompt: run `chunkeval answer` first")
+            raise RuntimeError(f"{path} is missing or older than the current questions, retrieval, document "
+                               f"titles or answer prompt: run `chunkeval answer` first")
         by_setup[setup] = {a.question_id: a for a in load_answers(path)}
     return by_setup
 

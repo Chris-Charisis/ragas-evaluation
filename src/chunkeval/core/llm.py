@@ -158,7 +158,8 @@ def check_ollama(cfg: Config, base_url: str) -> None:
         # 3. A model that doesn't fit in VRAM is split with the CPU and runs several times slower.
         gpu_share = loaded["size_vram"] / loaded["size"]
         if gpu_share < 1:
-            log.warning("%s (%s): only %.0f%% on GPU, the rest runs on the CPU",
+            # One decimal: gemma4:12b-it-q8_0's one layer on the CPU is 99.5%, which "%.0f" shows as 100%.
+            log.warning("%s (%s): only %.1f%% on GPU, the rest runs on the CPU",
                         model, ", ".join(roles), 100 * gpu_share)
         else:
             log.info("%s (%s): 100%% on GPU, context %s", model, ", ".join(roles), ctx)
@@ -252,10 +253,15 @@ class ChatLLM:
         context overflow, invalid JSON). API errors (timeouts, 5xx) come from the `openai` SDK
         after its own retries.
 
-        Behaviour measured on Ollama 0.30.4 (qwen3.5:9b-q8_0, gpt-oss:20b) — re-check after upgrades:
-          1. CONTEXT TRUNCATION IS SILENT: a 12k-token prompt came back with prompt_tokens = 8191
-             (the window) and no error; the start of the prompt (system message) was cut.
-             Detected below from `usage`.
+        Behaviour measured on Ollama 0.30.4 (qwen3.5:9b-q8_0, gpt-oss:20b), re-checked on 0.40.6
+        (2026-10-19, also gemma4:12b-it-q8_0) — re-check after upgrades:
+          1. CONTEXT TRUNCATION IS SILENT. 0.30.4: a 12k-token prompt came back with prompt_tokens =
+             8191 (the window) and no error; the start of the prompt (system message) was cut.
+             0.40.6: any prompt over the window is cut to HALF of it (prompt_tokens 4098 for 8.5k or
+             12k tokens; the log says "truncating input prompt", the reply nothing), keeping only
+             its first 5 tokens, so the system message is lost again. Native /api/chat refuses
+             instead with `truncate: false`, but /v1 ignores that option. Detected below from
+             `usage`: a prompt of half the window or more counts as truncated.
           2. THINKING: by default Qwen3.5 thinks first and spent all 400 max_tokens on it — empty
              content, finish_reason "length". On /v1 only `reasoning_effort="none"` turns it off
              (`think: false` in extra_body and Qwen's `/no_think` are ignored). Thinking goes to a
@@ -290,12 +296,17 @@ class ChatLLM:
         completion_tokens = response.usage.completion_tokens
 
         # Pitfall 1. Checked before "length" below, because an overflow also ends with "length"
-        # and this is the more useful message.
-        if self.context_length and prompt_tokens + completion_tokens >= self.context_length:
+        # and this is the more useful message. A truncated prompt reports half the window (0.40.6)
+        # or all of it (0.30.4), so half the window is the usable prompt budget. Largest prompts on
+        # the dev docs: 2,166 tokens (answer), 1,410 (critic), ~1,500 (gen-qa); at most 5 chunks of
+        # 512 tokens + instructions, ~3,100.
+        if self.context_length and (prompt_tokens >= self.context_length // 2
+                                    or prompt_tokens + completion_tokens >= self.context_length):
             raise LLMOutputError(
                 f"[{self.role}] context window full ({prompt_tokens} prompt + {completion_tokens} "
-                f"output tokens >= {self.context_length}): the prompt was probably truncated from "
-                f"the start. Shorten it or raise OLLAMA_CONTEXT_LENGTH and ollama.context_length.")
+                f"output tokens; window {self.context_length}, prompts must stay under half of it): "
+                f"the prompt was probably truncated and its start (the system message) lost. "
+                f"Shorten it or raise OLLAMA_CONTEXT_LENGTH and ollama.context_length.")
 
         # Pitfall 2: the answer was cut at max_tokens. Unusable for JSON, and a cut-off RAG answer
         # would be scored as if it were complete. Same request at temperature 0 = same result,

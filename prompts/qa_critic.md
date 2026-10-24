@@ -17,7 +17,7 @@ In the template sections, a literal dollar sign must be written `$$`.
 
 **Why the prompt is what it is** (measured on the 69 pairs of the 10 dev docs, 2026-10-11):
 - **The critic sees the passage** for the answer criteria. The old judge (`build_evaluation_prompt`, ragas_evaluation.py:424) saw only the question and answer, so it could check format but not truth.
-- **A different model family** from the generator (gpt-oss vs Qwen), so it is less likely to approve the generator's own mistakes.
+- **A different model family** from the generator (gpt-oss vs Gemma 4; Qwen on the dev docs), so it is less likely to approve the generator's own mistakes.
 - **The question criteria are judged without the passage.** With the passage in view, the critic resolved "the full model", "the two control villages" or "these enterprises" from it and gave standalone 5 to every pair, even when asked to list unresolved references first (it listed none, every time). Seeing the question alone, it finds them.
 - **A note before the scores.** Each call first writes what the scores then rest on: `question_asks_for` (passage call), compared with what the answer gives, and `unresolved_references` (question call). With one-line criteria and no note, the critic scored 5 on every criterion for 50 of 56 pairs, including an answer that named the very organisation the question was about; neither reasoning effort medium nor high changed that.
 - **"Your job is to find the flaw".** Stated plainly, so that a 5 means the problem was looked for, not the default.

@@ -13,8 +13,10 @@ from chunkeval.core.llm import LLMOutputError, LLMResult
 from chunkeval.core.store import read_jsonl, run_dir, write_jsonl
 from chunkeval.evaluation import answering
 from chunkeval.evaluation.answering import (ABSTENTION_PHRASE, GOLD_PASSAGE, PROMPT_PATH, answer_cache_path,
-                                            answer_path, build_messages, is_abstention, load_answers, load_prompt)
-from chunkeval.evaluation.retrieval import load_hits, load_questions, retrieval_path, variant_chunks
+                                            answer_path, build_messages, context, doc_titles, is_abstention,
+                                            load_answers, load_prompt)
+from chunkeval.evaluation.retrieval import (load_hits, load_questions, retrieval_path, stored_provenance,
+                                            variant_chunks)
 from chunkeval.evaluation.retrieval_metrics import question_metrics
 from chunkeval.qa.filtering import filter_paths
 from test_retrieval import VARIANT, make_pairs, offline, retrieve, stage  # noqa: F401  (fixtures used below)
@@ -35,14 +37,23 @@ def test_prompt_file_holds_the_abstention_phrase(tmp_path):
 
 def test_messages_show_the_passages_in_order_then_the_question():
     """The system message is shared by every call; the user message is the passages, numbered in
-    the order given and with their text only (a "$" in it survives), then the question."""
-    system, user = build_messages("How much did it cost?", ["Seed cost $5 per kg.", "Fertiliser was free."])
+    the order given, each with its document's title, then its text (a "$" in either survives),
+    then the question."""
+    system, user = build_messages("How much did it cost?", [("Seed prices in $ per kg", "Seed cost $5 per kg."),
+                                                            ("A fertiliser trial", "Fertiliser was free.")])
     assert system == {"role": "system", "content": load_prompt()["system"]}
-    assert build_messages("Other?", ["x"])[0] == system
+    assert build_messages("Other?", [("t", "x")])[0] == system
     content = user["content"]
-    order = [content.index(s) for s in ("Passage 1:", "Seed cost $5 per kg.", "Passage 2:", "Fertiliser was free.")]
+    order = [content.index(s) for s in ("Passage 1\nDocument: Seed prices in $ per kg\n", "Seed cost $5 per kg.",
+                                        "Passage 2\nDocument: A fertiliser trial\n", "Fertiliser was free.")]
     assert order == sorted(order) and user["role"] == "user"
     assert content.endswith("QUESTION: How much did it cost?")
+
+
+def test_context_is_the_title_line_then_the_text():
+    """What Ragas reads: the passage's title line as the generator saw it, then the text."""
+    assert context("A fertiliser trial", "Fertiliser was free.") == "Document: A fertiliser trial\nFertiliser was free."
+    assert "Document: $title\n" in load_prompt()["passage"]
 
 
 # --- abstentions ----------------------------------------------------------------------------------
@@ -137,11 +148,13 @@ def test_run_answers_every_setup_and_the_gold_passage(answers, tiny_doc):
 
     for qa, a in zip(pairs, retrieved):                                  # the primary embedder's top k
         top = hits[qa.id][:k]
-        assert a.chunk_ids == [h.chunk_id for h in top] and a.contexts == [text[h.chunk_id] for h in top]
+        assert a.chunk_ids == [h.chunk_id for h in top]
+        assert a.contexts == [context(tiny_doc.title, text[h.chunk_id]) for h in top]
         assert a.evidence_shown == bool(question_metrics(qa, top, k)["span_hit"])
     for qa, a in zip(pairs, gold):                                       # the question's own paragraph
         start, end = qa.meta["unit_spans"][0]
-        assert (a.contexts, a.chunk_ids, a.evidence_shown) == ([tiny_doc.text[start:end]], [], True)
+        assert (a.contexts, a.chunk_ids, a.evidence_shown) == ([context(tiny_doc.title, tiny_doc.text[start:end])],
+                                                               [], True)
     for a in retrieved + gold:
         assert a.abstained == (not any(REPLICATES in t for t in a.contexts))
         assert a.error is None and a.model == "fake-generator" and a.prompt_tokens > 0
@@ -150,7 +163,8 @@ def test_run_answers_every_setup_and_the_gold_passage(answers, tiny_doc):
 
     # one request per question and setup; the generator sees exactly the stored contexts
     assert len(generator.asked) == 2 * len(pairs)
-    assert generator.asked[0] == build_messages(pairs[0].question, retrieved[0].contexts)[1]["content"]
+    shown = [(tiny_doc.title, text[h.chunk_id]) for h in hits[pairs[0].id][:k]]
+    assert generator.asked[0] == build_messages(pairs[0].question, shown)[1]["content"]
     assert answer_path(cfg, "papers", VARIANT).with_name(f"papers_{VARIANT}.provenance.json").exists()
 
     summary = json.loads((run_dir(cfg) / "answer_summary.json").read_text(encoding="utf-8"))["papers"]
@@ -180,6 +194,32 @@ def test_rerun_asks_only_what_changed(answers):
     cfg.llm.rag_generator.max_tokens = 256                                # another generator setting
     answer(cfg)
     assert len(generator.asked) == 12
+
+
+def test_a_retitled_document_is_asked_again(answers, tiny_doc):
+    """A new title changes what the generator is shown, though the chunks and the retrieval stay the
+    same: every passage of the document is asked again, and the provenance records the new titles."""
+    cfg, generator, pairs = answers
+    answer(cfg)
+    before = stored_provenance(answer_path(cfg, "papers", VARIANT))["titles_sha256"]
+    path = cfg.paths.data_dir / "parsed" / "papers" / f"{tiny_doc.doc_id}.json"
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "title": "A retitled paper"}),
+                    encoding="utf-8")
+    answer(cfg)
+    assert len(generator.asked) == 12
+    for setup in (VARIANT, GOLD_PASSAGE):
+        assert all(c.startswith("Document: A retitled paper\n")
+                   for a in load_answers(answer_path(cfg, "papers", setup)) for c in a.contexts)
+        assert stored_provenance(answer_path(cfg, "papers", setup))["titles_sha256"] != before
+
+
+def test_doc_titles_include_documents_without_questions(answers, tiny_doc):
+    cfg, _, _ = answers
+    parsed = cfg.paths.data_dir / "parsed" / "papers"
+    other = {**json.loads((parsed / f"{tiny_doc.doc_id}.json").read_text(encoding="utf-8")),
+             "doc_id": "other", "title": "Another paper"}
+    (parsed / "other.json").write_text(json.dumps(other), encoding="utf-8")
+    assert doc_titles(cfg, "papers") == {tiny_doc.doc_id: tiny_doc.title, "other": "Another paper"}
 
 
 def test_stale_retrieval_is_refused(answers):

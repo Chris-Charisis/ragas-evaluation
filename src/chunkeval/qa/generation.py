@@ -119,7 +119,8 @@ QUESTION_TYPES: tuple[str, ...] = get_args(QuestionType)
 # What the generator must return: a Q-A pair, or {"skip": true, "reason": ...} when the passage has
 # nothing worth asking (the escape hatch of the prompt, which replaces the old "N/A" / "I don't
 # know"). `ChatLLM.chat` validates every answer against it; with thinking off, Qwen3.5 on Ollama
-# ignores it as a decoding constraint, so the prompt spells out the same shapes.
+# ignores it as a decoding constraint, so the prompt spells out the same shapes. Gemma 4 (Ollama
+# 0.40.6) follows it even when the prompt doesn't describe the format.
 # - The pair may carry "skip": false: a model shown both shapes sometimes writes it, and rejecting
 #   that would lose a good pair over a formality.
 # - The skip "reason" is optional, so a bare {"skip": true} still counts as a skip, not an error.
@@ -649,8 +650,8 @@ def check_provenance(paths: dict[str, Path], settings: dict[str, Any], docs: lis
 def summarize(paths: dict[str, Path]) -> dict[str, dict[str, Any]]:
     """Per corpus, over everything in the files (all runs): units, pairs, the pair rate, drops by
     reason, how the evidence was located, the question types, and the two-span units within one
-    section vs across a section boundary (on the dev docs the model skipped every cross-section
-    pair it was given: re-check on the full corpus, see README "Before the QA stage")."""
+    section vs across a section boundary (on the dev docs Qwen skipped every cross-section pair it
+    was given; on the full corpus Gemma gives a pair for about a third of them, docs/qa.md)."""
     summary: dict[str, dict[str, Any]] = {}
 
     def entry(corpus: str) -> dict[str, Any]:

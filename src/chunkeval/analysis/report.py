@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from chunkeval.analysis.inputs import Inputs, run_path
+from chunkeval.analysis.inputs import METHOD_LABELS, Inputs, label, run_path
 from chunkeval.analysis.stats import LOW_N, MIN_CLUSTER_DOCS, TIE
 from chunkeval.analysis.views import HEADLINE_SPAN, OUTCOMES, bin_order
 from chunkeval.core.schema import REPO_ROOT, Config
@@ -181,6 +181,10 @@ def how_to_read(doc: Doc, cfg: Config) -> None:
     a = cfg.analysis
     doc.add("## How to read this report")
     doc.add(
+        "- **Methods:** **fixed-size** cuts windows of a fixed number of characters at the nearest space, "
+        "**sentence** packs whole sentences, and **section** packs whole sentences without crossing a section "
+        "boundary. The config and the data files name them by their keys: "
+        + ", ".join(f"{name} is `{key}`" for key, name in METHOD_LABELS.items()) + ".",
         f"- **Setups** are the chunkers: method × overlap. Retrieval uses `{cfg.embedding.primary}`, and the "
         f"generator is shown its top {cfg.retrieval.top_k} chunks. Two references bound them: the **gold passage** "
         "(each question answered from its own passage, i.e. perfect retrieval: the ceiling of the generation metrics) "
@@ -223,7 +227,7 @@ def run_record_section(doc: Doc, record: dict[str, Any]) -> None:
                                   f"({c['documents_parsed']} parsed); {c['ragas_questions']} in the Ragas table"))
     rows.append(("Ragas sample", record["ragas_sample"]))
     ch = record["chunking"]
-    rows.append(("chunking", f"{', '.join(ch['methods'])} × overlap {ch['overlap']}; target {ch['target_tokens']}, "
+    rows.append(("chunking", f"{', '.join(map(label, ch['methods']))} × overlap {ch['overlap']}; target {ch['target_tokens']}, "
                              f"max {ch['max_tokens']} tokens, overlap ratio {ch['overlap_ratio']}; sizes by {ch['size_tokenizer']}"))
     rows += [(f"embedder {name}", pin) for name, pin in record["embedders"].items()]
     rt = record["retrieval"]
@@ -231,7 +235,7 @@ def run_record_section(doc: Doc, record: dict[str, Any]) -> None:
                               f"budget {rt['budget_tokens']} tokens; k_max {rt['k_max']}"))
     rows += [(k, str(v)) for k, v in record["models"].items() if v]
     an = record["analysis"]
-    rows.append(("analysis", f"baseline {an['baseline']}; {an['bootstrap_iterations']} bootstrap draws; "
+    rows.append(("analysis", f"baseline {label(an['baseline'])}; {an['bootstrap_iterations']} bootstrap draws; "
                              f"{an['ci']:.0%} intervals; alpha {an['alpha']}; seed {an['seed']}"))
     if "judge_cost" in record:
         jc = record["judge_cost"]
@@ -279,7 +283,7 @@ def retrieval_section(doc: Doc, cfg: Config, inputs: Inputs, t: dict[str, pd.Dat
     rm = t["retrieval_means"]
     shown = ["span_hit", "span_recall", "all_evidence", "mrr", "precision", "context_tokens"]
     doc.add(f"## 3. Retrieval ({primary})")
-    doc.add(f"### 3.1 At k = {top}", "What the generator is shown. Definitions of the span metrics: README, "
+    doc.add(f"### 3.1 At k = {top}", "What the generator is shown. Definitions of the span metrics: docs/evaluation.md, "
             "\"Retrieval and span metrics\".")
     for corpus in inputs.corpora:
         doc.add(f"**{corpus}**", md(means_wide(rm[(rm["corpus"] == corpus) & (rm["embedder"] == primary)
@@ -307,7 +311,7 @@ def retrieval_section(doc: Doc, cfg: Config, inputs: Inputs, t: dict[str, pd.Dat
     doc.figure(figs.get("retrieval_budget"), out, "span metrics per setup at the token budget")
 
     vb = t["retrieval_vs_baseline"]
-    doc.add(f"### 3.3 Setups against the baseline ({cfg.analysis.baseline})",
+    doc.add(f"### 3.3 Setups against the baseline ({label(cfg.analysis.baseline)})",
             verdict_summary(vb, "setup") + f" Shown: k = {top}; every span metric at k = {top} and at the budget "
             "is in `tables/retrieval_vs_baseline.csv`.",
             "Precision and IoU count text that overlapping chunks repeat once, while `context_tokens` (what the "
@@ -417,7 +421,7 @@ def generation_section(doc: Doc, cfg: Config, inputs: Inputs, t: dict[str, pd.Da
     doc.figure(figs.get("generation_means"), out, "generation metrics per setup")
 
     vb = t["generation_vs_baseline"]
-    doc.add(f"### 4.3 Setups against the baseline ({cfg.analysis.baseline})",
+    doc.add(f"### 4.3 Setups against the baseline ({label(cfg.analysis.baseline)})",
             verdict_summary(vb, "setup") + " Every metric: `tables/generation_vs_baseline.csv`.")
     for corpus in inputs.corpora:
         doc.add(f"**{corpus}**", md(comparison_rows(vb[vb["corpus"] == corpus], COMPARED_GEN)))

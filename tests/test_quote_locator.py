@@ -6,7 +6,7 @@ import pytest
 
 from chunkeval.core.schema import REPO_ROOT
 from chunkeval.corpus.parsing import SEPARATOR, load_doc
-from chunkeval.qa.generation import _INVISIBLE, _QUOTE_EDGES, MIN_QUOTE_WORDS, locate_quote
+from chunkeval.qa.generation import _INVISIBLE, _QUOTE_EDGES, MIN_QUOTE_WORDS, _normalize, locate_quote
 
 THRESHOLD = 90   # cfg.qa.fuzzy_match_threshold
 
@@ -115,7 +115,7 @@ def test_too_short_quote_rejected():
     assert locate_quote(". . . . . .", text, spans, THRESHOLD) is None
 
 
-# --- the real dev docs ----------------------------------------------------------------------------
+# --- the parsed corpus ----------------------------------------------------------------------------
 
 PARSED = sorted((REPO_ROOT / "data" / "parsed").glob("*/*.json"))
 # What a model types instead of the typographic characters in the text.
@@ -126,18 +126,21 @@ ASCII = str.maketrans({**dict.fromkeys("‐‑‒–—―−", "-"),
 
 @pytest.mark.skipif(not PARSED, reason="no parsed docs in data/parsed: run `chunkeval parse` first")
 def test_parsed_docs():
-    """One random word-aligned quote from every block of the parsed dev docs. Verbatim, it matches
+    """One random word-aligned quote from every block of the parsed docs. Verbatim, it matches
     exactly. With the drift a model adds (ASCII dashes and quotes, soft hyphens dropped, first
     letter capitalised, a full stop added) it matches normalized, at the same span minus the
     stripped edge punctuation and invisible characters (paper_74 has a quote ending in a soft
     hyphen, "coun\\xad"). Real Docling text, so a character that breaks the offset map of
     `_normalize` shows up here."""
-    edges = _QUOTE_EDGES + "".join(_INVISIBLE)
+    # "…" too: folded to "..." (NFKC), it is stripped like a final full stop (report_53).
+    edges = _QUOTE_EDGES + "".join(_INVISIBLE) + "…"
     rng = random.Random(0)
     for path in PARSED:
         doc = load_doc(path)
         for block in doc.blocks:
-            words = [m.span() for m in re.finditer(r"\S+", doc.text[block.start:block.end])]
+            # A lone soft hyphen is no word (report_126): a quote of it plus 4 words is under MIN_QUOTE_WORDS.
+            words = [m.span() for m in re.finditer(r"\S+", doc.text[block.start:block.end])
+                     if m.group().strip("".join(_INVISIBLE))]
             if block.type == "heading" or len(words) < MIN_QUOTE_WORDS:
                 continue
             i = rng.randrange(len(words) - MIN_QUOTE_WORDS + 1)
@@ -151,8 +154,14 @@ def test_parsed_docs():
             ev = locate_quote(quote, doc.text, unit, THRESHOLD)
             assert (ev.match, ev.start, ev.end) == ("exact", start, end), (path.stem, quote)
 
+            # Folded, a quote can also match an earlier passage that differs only in punctuation
+            # ("at field stage (25 months)" before "at field stage 25 months)." in paper_69).
+            if _normalize(doc.text[block.start:block.end])[0].count(_normalize(quote.strip(edges))[0]) > 1:
+                continue
             drifted = quote.translate(ASCII).replace("­", "")
-            ev = locate_quote(drifted[0].upper() + drifted[1:] + ".", doc.text, unit, THRESHOLD)
+            # "ß".upper() is "SS" (report_19's formula): capitalised only where that keeps one char.
+            first = drifted[0].upper() if len(drifted[0].upper()) == 1 else drifted[0]
+            ev = locate_quote(first + drifted[1:] + ".", doc.text, unit, THRESHOLD)
             lead = len(quote) - len(quote.lstrip(edges))
             trail = len(quote) - len(quote.rstrip(edges))
             assert (ev.match, ev.start, ev.end) == ("normalized", start + lead, end - trail), (path.stem, quote)

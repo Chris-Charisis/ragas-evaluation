@@ -75,7 +75,7 @@ from pathlib import Path
 import pandas as pd
 
 from chunkeval.analysis import cases, plots, report, views
-from chunkeval.analysis.inputs import Inputs, load_inputs
+from chunkeval.analysis.inputs import Inputs, label, load_inputs
 from chunkeval.core.config import Secrets
 from chunkeval.core.schema import Config
 from chunkeval.core.store import run_dir
@@ -155,7 +155,7 @@ def figures(cfg: Config, inputs: Inputs, t: dict[str, pd.DataFrame], g: pd.DataF
         "retrieval_vs_baseline": plots.diff_plot(
             t["retrieval_vs_baseline"][t["retrieval_vs_baseline"]["k_label"] == top], views.HEADLINE_SPAN, corpora,
             setups, main / "retrieval_vs_baseline.png",
-            f"Setup − {cfg.analysis.baseline}, paired over questions (k = {top})"),
+            f"Setup − {label(cfg.analysis.baseline)}, paired over questions (k = {top})"),
         "k_curves": plots.k_curves(rm, primary, corpora, setups, cfg.retrieval.top_k, main / "k_curves.png"),
         "context_vs_recall": plots.context_vs_recall(t["context_vs_recall"], primary, corpora, setups,
                                                      second / "context_vs_recall.png"),
@@ -167,7 +167,7 @@ def figures(cfg: Config, inputs: Inputs, t: dict[str, pd.DataFrame], g: pd.DataF
                                                   "Generation metrics per setup, the gold passage as the ceiling")
         figs["generation_vs_baseline"] = plots.diff_plot(t["generation_vs_baseline"], shown, corpora, setups,
                                                          main / "generation_vs_baseline.png",
-                                                         f"Setup − {cfg.analysis.baseline}, paired over questions")
+                                                         f"Setup − {label(cfg.analysis.baseline)}, paired over questions")
         figs["generation_vs_gold"] = plots.diff_plot(t["generation_vs_gold"], shown, corpora, setups,
                                                      main / "generation_vs_gold.png",
                                                      "Setup − gold passage: what retrieval with each chunker costs")

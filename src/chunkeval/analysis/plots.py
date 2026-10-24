@@ -53,7 +53,7 @@ def style() -> None:
 
 
 def method_of(setup: str) -> str:
-    """character_no_overlap, character_overlap -> character."""
+    """fixed-size_no_overlap, fixed-size_overlap -> fixed-size."""
     return setup.rsplit("_overlap", 1)[0].removesuffix("_no")
 
 

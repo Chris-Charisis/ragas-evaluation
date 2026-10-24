@@ -176,6 +176,7 @@ def test_judge_sends_the_config_settings_and_counts_usage(cfg, monkeypatch):
     params = client.params[0]
     assert params["model"] == cfg.llm.judge.model and params["temperature"] == cfg.llm.judge.temperature
     assert params["seed"] == cfg.seed and "n" not in params and [m["role"] for m in params["messages"]] == ["user"]
+    assert params.get("reasoning_effort") == cfg.llm.judge.reasoning_effort
     assert record["output"]["statements"][0]["verdict"] == 1 and records == [record]
     assert record["input_tokens"] == len(client.prompts[0]) // 4 and record["requests"] == 1
     price = cfg.ragas.prices[cfg.llm.judge.model]
@@ -354,8 +355,10 @@ def test_the_cap_stops_a_run_whose_estimate_was_too_low(evaluated, monkeypatch):
     """The spend is checked before every call: once it reaches the cap, nothing more is asked; what was
     paid is cached and nothing is written."""
     cfg, client = evaluated
+    cfg.ragas.max_cost_usd = 5                                            # whatever the config's cap is now
     monkeypatch.setattr(ragas_eval, "count_tokens", lambda text: 0)        # estimate: $0
-    client.prompt_tokens = 10_000_000                                     # each call: $4 at $0.40 per 1M
+    price = cfg.ragas.prices[cfg.llm.judge.model].input
+    client.prompt_tokens = int(4 / price * 1e6)                           # each call: $4 at the judge's price
     with pytest.raises(RuntimeError, match="the cap ragas.max_cost_usd .* was reached"):
         evaluate(cfg)
     assert 1 <= len(client.prompts) <= cfg.ragas.max_workers + 1
@@ -398,5 +401,17 @@ def test_stale_answers_are_refused(evaluated):
     write_jsonl(filter_paths(cfg)["filtered"], pairs)
     retrieve(cfg)                                                    # retrieved again, not answered again
     with pytest.raises(RuntimeError, match="run `chunkeval answer` first"):
+        evaluate(cfg)
+    assert client.prompts == []
+
+
+def test_answers_shown_another_title_are_refused(evaluated):
+    """A retitled document leaves the chunks and the retrieval as they were, but not what the answers
+    were made from."""
+    cfg, client = evaluated
+    path = cfg.paths.data_dir / "parsed" / "papers" / "tiny.json"
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "title": "A retitled paper"}),
+                    encoding="utf-8")
+    with pytest.raises(RuntimeError, match="document titles .* run `chunkeval answer` first"):
         evaluate(cfg)
     assert client.prompts == []

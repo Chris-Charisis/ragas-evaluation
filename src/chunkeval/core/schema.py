@@ -58,6 +58,7 @@ class BodyRule(StrictConfig):
     start_titles: list[str] = []
     end_titles: list[str] = []
     drop_titles: list[str] = []
+    drop_title_prefixes: list[str] = []     # first word of the title: "Annex 2: Workshop agenda"
 
 
 class Parsing(StrictConfig):
@@ -67,6 +68,14 @@ class Parsing(StrictConfig):
     ocr_max_repeated_paragraph_ratio: float = Field(ge=0, le=1)
     body: dict[str, BodyRule] = {}       # per corpus; a corpus without a rule keeps its whole text
     skip_section_titles: list[str]
+    # CSV (corpus, doc_id, title) of titles that replace the one Docling found; relative to the repo root.
+    title_overrides: Path | None = None
+
+    @model_validator(mode="after")
+    def resolve_against_repo_root(self):
+        if self.title_overrides is not None:
+            self.title_overrides = REPO_ROOT / self.title_overrides
+        return self
 
 
 class EmbModel(StrictConfig):
@@ -138,7 +147,7 @@ class LLMModel(StrictConfig):
     temperature: float = Field(default=0.0, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)   # None = no explicit limit
     # Sent as `reasoning_effort` only when set: non-reasoning OpenAI models reject it.
-    # On Ollama /v1, "none" is the only switch that turns Qwen3.5's thinking off; gpt-oss
+    # On Ollama /v1, "none" is the only switch that turns Qwen3.5's thinking off (Gemma 4's too); gpt-oss
     # can't turn it off, but "low" cuts it to a few dozen tokens.
     reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
 

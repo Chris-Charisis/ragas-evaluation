@@ -13,8 +13,8 @@ import pandas as pd
 import pytest
 
 from chunkeval import analysis
-from chunkeval.analysis import views
-from chunkeval.analysis.inputs import load_inputs
+from chunkeval.analysis import plots, views
+from chunkeval.analysis.inputs import METHOD_LABELS, label, load_inputs
 from chunkeval.analysis.stats import (bootstrap_ci, detectable_difference, holm, paired_diff, paired_family, rng_for,
                                       verdict)
 from chunkeval.core.config import Secrets, load_config
@@ -123,6 +123,13 @@ def test_size_bins_are_terciles_in_order():
     assert list(labels) == ["short (10–20 chars)"] * 2 + ["medium (30–40 chars)"] * 2 + ["long (50–60 chars)"] * 2
     assert sorted(set(labels), key=views.bin_order)[0].startswith("short")
     assert set(views.size_bins(pd.Series([7, 7]), views.BIN_NAMES, "words")) == {"all (7 words)"}
+
+
+def test_report_names_replace_the_method_keys():
+    keys = ["character_no_overlap", "recursive_overlap", "sentence_overlap", GOLD_PASSAGE, "character", "recursive"]
+    assert list(map(label, keys)) == ["fixed-size_no_overlap", "section_overlap", "sentence_overlap", GOLD_PASSAGE,
+                                      "fixed-size", "section"]
+    assert plots.method_of(label("character_no_overlap")) == plots.method_of(label("character_overlap")) == "fixed-size"
 
 
 # --- the stage on the offline pipeline ------------------------------------------------------------
@@ -254,3 +261,5 @@ def test_report_on_the_dev_run(tmp_path):
     assert (vb["p_holm"] >= vb["p"] - 1e-12).all()
     assert ((vb["verdict"].fillna("") != "") <= ((vb["low"] > 0) | (vb["high"] < 0))).all()
     assert (out / "cases.md").read_text(encoding="utf-8").startswith("# Cases to read")
+    text = (out / "report.md").read_text(encoding="utf-8")
+    assert not any(f"{key}_" in text for key in METHOD_LABELS)                # every setup under its report name

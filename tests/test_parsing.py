@@ -2,7 +2,8 @@
 import pytest
 
 from chunkeval.core.schema import BodyRule
-from chunkeval.corpus.parsing import Piece, assemble_doc, select_body, title_matches
+from chunkeval.corpus.parsing import (Piece, assemble_doc, ocr_helps, select_body, title_has_prefix,
+                                      title_matches)
 
 
 def H(text, level=1):
@@ -55,12 +56,73 @@ def test_end_marker_before_the_start_is_ignored():
 
 
 def test_report_drops_sections_with_their_subsections():
-    pieces = [H("Contents", 2), P("toc"), H("Message", 1), P("m"),
+    m = "m" * 500                               # the report's text, so the dropped sections stay small
+    pieces = [H("Contents", 2), P("toc"), H("Message", 1), P(m),
               H("Publications 2019", 1), H("Selected titles", 3), P("Smith 2019."),
               H("Finance", 1), P("$")]
     kept, body = select_body(pieces, BodyRule(drop_titles=["contents", "publications"]))
-    assert [p.text for p in kept] == ["Message", "m", "Finance", "$"]
+    assert [p.text for p in kept] == ["Message", m, "Finance", "$"]
     assert body["dropped_sections"] == ["Contents", "Publications 2019"]
+    assert body["dropped_own_text_only"] == []
+
+
+def test_a_dropped_section_never_swallows_the_document():
+    """report_112: "Table of contents" in a larger font than the chapters after it, so they all look
+    like its subsections; over DROP_MAX_SHARE only its own text goes."""
+    pieces = [H("Table of contents", 1), P("Introduction ... 3"), H("Introduction", 2), P("x" * 300),
+              H("Results", 2), P("y" * 300), H("References", 2), P("Smith 2020.")]
+    kept, body = select_body(pieces, BodyRule(drop_titles=["table of contents", "references"]))
+    assert [p.text for p in kept] == ["Introduction", "x" * 300, "Results", "y" * 300]
+    assert body["dropped_own_text_only"] == ["Table of contents"]
+
+
+def test_drop_title_prefixes():
+    pieces = [H("Results", 1), P("r" * 500), H("Annex 2: Workshop agenda", 1), P("8:30 Opening"),
+              H("Appendix A Consumer questionnaire", 1), P("Q1"), H("Annexed land", 1), P("kept")]
+    kept, body = select_body(pieces, BodyRule(drop_title_prefixes=["annex", "appendix"]))
+    assert [p.text for p in kept] == ["Results", "r" * 500, "Annexed land", "kept"]
+    assert body["dropped_sections"] == ["Annex 2: Workshop agenda", "Appendix A Consumer questionnaire"]
+
+
+@pytest.mark.parametrize("title, matches", [
+    ("Annex 2: Workshop agenda", True), ("ANNEX", True), ("Appendix A Consumer questionnaire", True),
+    ("Annexed land", False), ("The annex", False), ("", False),
+])
+def test_title_has_prefix(title, matches):
+    assert title_has_prefix(title, ["annex", "appendix"]) is matches
+
+
+def test_a_parenthesis_is_not_a_lead_label():
+    """paper_64: "(Additional file 1: Table S1) ..." opens a Results paragraph, it is not back matter."""
+    pieces = [H("Background"), P("b" * 200), H("Results"), P("(Additional file 1: Table S1) shows it."),
+              P("r" * 200), P("Additional file 1: Table S1."), H("References"), P("Smith.")]
+    kept, body = select_body(pieces, BodyRule(start_titles=["background"], end_titles=["additional file", "references"]))
+    assert body["end"] == "Additional file 1" and kept[-1].text == "r" * 200
+
+
+def test_a_lead_label_in_the_first_quarter_is_front_matter():
+    """paper_75: PLOS ONE's "Competing Interests: ..." footnote lands right after the Introduction heading."""
+    pieces = [H("Introduction"), P("Competing Interests: The authors declare none."), P("i" * 400),
+              H("Results"), P("r" * 400), P("Funding: Agency X."), H("References"), P("Smith.")]
+    rule = BodyRule(start_titles=["introduction"], end_titles=["competing interests", "funding", "references"])
+    kept, body = select_body(pieces, rule)
+    assert body["end"] == "Funding" and [p.text for p in kept][-1] == "r" * 400
+
+
+@pytest.mark.parametrize("auto, full_page, helps", [
+    ({"replacement_char_ratio": 0.05, "repeated_paragraph_ratio": 0.01},
+     {"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.015}, True),     # report_2: fixed
+    ({"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.58},
+     {"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.11}, True),      # report_77: more than halved
+    ({"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.07},
+     {"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.042}, True),     # paper_52: under the threshold
+    ({"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.43},
+     {"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.43}, False),     # report_133: repeats are real
+    ({"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.067},
+     {"replacement_char_ratio": 0.0, "repeated_paragraph_ratio": 0.054}, False),    # report_140
+])
+def test_ocr_helps(cfg, auto, full_page, helps):
+    assert ocr_helps(auto, full_page, cfg) is helps
 
 
 def test_selected_body_assembles_into_a_valid_doc():

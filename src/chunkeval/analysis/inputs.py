@@ -10,6 +10,11 @@ and name the stage to re-run:
     pilot), and each retrieved row's evidence_shown equals span_hit at top_k in the retrieval table
     (else `answer`, then `eval`); details.jsonl has exactly its rows (else `eval`).
 The Ragas table is optional: before `eval` has run, the report covers retrieval only.
+
+Names (decided 2026-10-22): the report calls the chunkers fixed-size, sentence and section
+(METHOD_LABELS). "character" and "recursive" read as LangChain's CharacterTextSplitter and
+RecursiveCharacterTextSplitter, which cut differently. The config, the file names and the stored tables
+keep the keys; `load_inputs` checks everything under the keys, then renames (`relabel`).
 """
 from __future__ import annotations
 
@@ -52,14 +57,36 @@ def variant_name(method: str, overlap: bool) -> str:
     return f"{method}_{'overlap' if overlap else 'no_overlap'}"
 
 
+METHOD_LABELS = {"character": "fixed-size", "recursive": "section"}
+
+
+def label(name: str) -> str:
+    """A method or setup as the report names it: character_overlap -> fixed-size_overlap; others unchanged."""
+    method, sep, rest = name.partition("_")
+    return METHOD_LABELS.get(method, method) + sep + rest
+
+
+def relabel(inputs: Inputs) -> Inputs:
+    """Every method and setup in the loaded inputs under its report name (module docstring)."""
+    for df in (inputs.retrieval, inputs.ragas):
+        if df is not None:
+            df["method"] = df["method"].map(label, na_action="ignore")
+            df["setup"] = df["setup"].map(label)
+    inputs.setups = [label(s) for s in inputs.setups]
+    inputs.hits = {(c, label(s)): v for (c, s), v in inputs.hits.items()}
+    inputs.chunks_per_doc = {(c, label(s)): v for (c, s), v in inputs.chunks_per_doc.items()}
+    inputs.details = {(q, label(s)): v for (q, s), v in inputs.details.items()}
+    return inputs
+
+
 def run_path(cfg: Config, *parts: str) -> Path:
     """runs/<run_id>/<parts>, without creating it (run_dir creates folders)."""
     return cfg.paths.runs_dir.joinpath(cfg.run_id, *parts)
 
 
 def load_inputs(cfg: Config) -> Inputs:
-    """Both long tables, the questions, the primary embedder's hits and details.jsonl, checked
-    (module docstring)."""
+    """Both long tables, the questions, the primary embedder's hits and details.jsonl, checked, under the
+    report's names (module docstring)."""
     by_corpus = load_questions(cfg)
     corpora = [c for c in cfg.paths.corpora if by_corpus.get(c)]
     questions = {qa.id: qa for c in corpora for qa in by_corpus[c]}
@@ -79,7 +106,7 @@ def load_inputs(cfg: Config) -> Inputs:
     if not ragas_path.exists():
         log.warning("%s not found: the report covers retrieval only (run `chunkeval eval` for the generation "
                     "metrics)", ragas_path)
-        return inputs
+        return relabel(inputs)
     summary_path = run_path(cfg, "ragas_summary.json")
     if summary_path.exists():
         inputs.pilot = json.loads(summary_path.read_text(encoding="utf-8")).get("pilot")
@@ -87,7 +114,7 @@ def load_inputs(cfg: Config) -> Inputs:
     check_ragas(cfg, ragas, retrieval, by_corpus, setups, inputs.pilot, ragas_path)
     inputs.ragas = ragas
     inputs.details = load_details(run_path(cfg, "ragas", "details.jsonl"), ragas)
-    return inputs
+    return relabel(inputs)
 
 
 def check_retrieval(cfg: Config, retrieval: pd.DataFrame, by_corpus: dict[str, list[QAPair]], corpora: list[str],

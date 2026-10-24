@@ -20,7 +20,9 @@ Next:   chunking/* and qa/generation.py
 from __future__ import annotations
 
 import bisect
+import csv
 import functools
+import hashlib
 import json
 import logging
 import re
@@ -71,7 +73,10 @@ FRONT_MATTER_TITLE = "(front matter)"
 
 # Bump when a change in this module changes the parsed output: `parse_corpus` then parses the
 # PDFs again instead of serving the stale cached JSONs.
-PARSER_VERSION = 3
+# 4 (2026-10-20, full-corpus audit): lead labels start with a letter and not in the body's first
+# quarter, DROP_MAX_SHARE, drop_title_prefixes, OCR kept only when it helps, title overrides,
+# the PDF's MD5 in meta (cache key).
+PARSER_VERSION = 4
 
 # The simple case of a duplicated text layer: a paragraph contained in the paragraph right before
 # it (or containing it) is a copy. The minimum length keeps short legitimate repeats.
@@ -164,11 +169,16 @@ def parse_pdf(pdf_path: Path, corpus: str, cfg: Config) -> CanonicalDoc:
     text_layer = {"auto": text_layer_ratios(result.document, pieces)}
     if problems := text_layer_problems(text_layer["auto"], cfg):
         log.warning("%s: %s; converting again with full-page OCR", pdf_path.name, ", ".join(problems))
-        ocr = "full_page"
-        result, pieces, skipped, duplicates = _convert(pdf_path, include, full_page_ocr=True)
-        text_layer["full_page"] = text_layer_ratios(result.document, pieces)
-        if problems := text_layer_problems(text_layer["full_page"], cfg):
-            log.warning("%s: still %s after OCR", pdf_path.name, ", ".join(problems))
+        ocr_result = _convert(pdf_path, include, full_page_ocr=True)
+        text_layer["full_page"] = text_layer_ratios(ocr_result[0].document, ocr_result[1])
+        if ocr_helps(text_layer["auto"], text_layer["full_page"], cfg):
+            ocr = "full_page"
+            result, pieces, skipped, duplicates = ocr_result
+            if problems := text_layer_problems(text_layer["full_page"], cfg):
+                log.warning("%s: still %s after OCR", pdf_path.name, ", ".join(problems))
+        else:
+            log.warning("%s: OCR doesn't fix it (%s), the text layer is kept", pdf_path.name,
+                        ", ".join(text_layer_problems(text_layer["full_page"], cfg)) or "?")
     if result.status.value != "success":
         log.warning("%s: Docling status %s, some pages may be missing", pdf_path.name, result.status.value)
 
@@ -202,6 +212,7 @@ def parse_pdf(pdf_path: Path, corpus: str, cfg: Config) -> CanonicalDoc:
         source = str(pdf_path)
     meta = {
         "source": source,
+        "pdf_md5": _md5(pdf_path),      # cache key, see _is_up_to_date
         "pages": len(ddoc.pages),
         "parser": _parser_name(),
         "parser_version": PARSER_VERSION,
@@ -218,7 +229,12 @@ def parse_pdf(pdf_path: Path, corpus: str, cfg: Config) -> CanonicalDoc:
         "body_rule": rule.model_dump() if rule else None,  # cache key, see _is_up_to_date
         "body": body,
     }
-    doc = assemble_doc(pdf_path.stem, corpus, doc_title(ddoc, fallback=pdf_path.stem), pieces, meta)
+    title = doc_title(ddoc, fallback=pdf_path.stem)
+    # cfg.parsing.title_overrides: Docling found no title, or a banner ("RTB Working Paper", "1").
+    if override := title_overrides(cfg).get((corpus, pdf_path.stem)):
+        meta["docling_title"], title = title, override
+    meta["title_override"] = override            # cache key, see _is_up_to_date
+    doc = assemble_doc(pdf_path.stem, corpus, title, pieces, meta)
     log.info("%s: %d pages, %d blocks, %d sections, %d chars (ocr=%s)",
              pdf_path.name, meta["pages"], len(doc.blocks), len(doc.sections), len(doc.text), ocr)
     return doc
@@ -271,6 +287,24 @@ def text_layer_problems(ratios: dict[str, float], cfg: Config) -> list[str]:
     if ratios["repeated_paragraph_ratio"] > cfg.parsing.ocr_max_repeated_paragraph_ratio:
         problems.append(f"{ratios['repeated_paragraph_ratio']:.1%} of the paragraphs repeated (duplicated text layer)")
     return problems
+
+
+def _thresholds(cfg: Config) -> dict[str, float]:
+    return {"replacement_char_ratio": cfg.parsing.ocr_max_replacement_char_ratio,
+            "repeated_paragraph_ratio": cfg.parsing.ocr_max_repeated_paragraph_ratio}
+
+
+def ocr_helps(auto: dict[str, float], full_page: dict[str, float], cfg: Config) -> bool:
+    """Whether the full-page OCR conversion replaces the text layer: every ratio over its threshold
+    in `auto` must come under the threshold or at least halve with OCR.
+
+    When it doesn't, the "problem" is in the page itself, not in a broken layer: on the full corpus
+    (2026-10-20) 25 of 38 OCR'd documents kept the same repeated-paragraph ratio after OCR (a form
+    template printed 5 times, herbarium entries in an annex, ...). The text layer is exact, while
+    OCR adds noise (garbled blocks in paper_8), so it is kept.
+    """
+    return all(full_page[k] <= max(limit, auto[k] / 2)
+               for k, limit in _thresholds(cfg).items() if auto[k] > limit)
 
 
 def replacement_char_ratio(ddoc: DoclingDocument) -> float:
@@ -490,6 +524,17 @@ def _char_boxes(page: Any) -> list[tuple[float, float, float]]:
         textpage.close()
 
 
+def title_overrides(cfg: Config) -> dict[tuple[str, str], str]:
+    """cfg.parsing.title_overrides as {(corpus, doc_id): title}; empty without the file setting.
+    Read on every call (a small CSV), so an edit is picked up by the next parse."""
+    path = cfg.parsing.title_overrides
+    if path is None:
+        return {}
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    return {(r["corpus"], r["doc_id"]): r["title"].strip() for r in rows if r["title"].strip()}
+
+
 def doc_title(ddoc: DoclingDocument, fallback: str) -> str:
     """Docling's TITLE item if there is one, else the longest heading on page 1 (a journal banner
     like "ORIGINAL ARTICLE" often precedes the real title), else `fallback`."""
@@ -503,8 +548,21 @@ def doc_title(ddoc: DoclingDocument, fallback: str) -> str:
     return max(first_page, key=len, default="") or fallback
 
 
-# The label of a paragraph that opens with one: "Funding: This research was funded by ...".
-_LEAD_LABEL = re.compile(r"([^:]{1,50}):\s")
+# The label of a paragraph that opens with one: "Funding: This research was funded by ...". It must
+# start with a letter: "(Additional file 1: Table S1) shows ..." is a sentence, not back matter
+# (it cut paper_64 and paper_71 in the middle of their Results, 2026-10-20).
+_LEAD_LABEL = re.compile(r"([^\W\d_][^:]{0,49}):\s")
+
+# A lead label in the first quarter of the body is front matter that Docling placed after the start
+# heading, e.g. PLOS ONE's first-page "Competing Interests: ..." footnote, which cut paper_75 to its
+# first 921 chars. Real back-matter paragraphs come after the conclusions.
+FRONT_LABEL_SHARE = 0.25
+
+# A dropped section takes its subsections only while they stay under this share of the document.
+# Above it the heading levels are wrong (a "Contents" or "Acknowledgments" heading set in a larger
+# font than the chapters after it swallowed 50-99% of report_112, 127, 5, 103 and 114), so only
+# its own text is dropped, up to the next heading.
+DROP_MAX_SHARE = 0.2
 
 
 def select_body(pieces: list[Piece], rule: BodyRule | None) -> tuple[list[Piece], dict[str, Any]]:
@@ -516,16 +574,19 @@ def select_body(pieces: list[Piece], rule: BodyRule | None) -> tuple[list[Piece]
          affiliations and abstract go. None -> no cut.
       2. end_titles: drop everything from the first such heading after the start, or the first
          paragraph whose lead label is one ("Funding: ...": MDPI prints its back matter as
-         paragraphs inside the Conclusions section). None -> no cut. A cut and not a per-section
-         drop, because a paper's back matter runs to the end and its headings are often unlisted
-         ("Downloads", "Submit your manuscript...") or wrongly nested (paper_8).
-      3. drop_titles: drop each such section with its subsections (up to the next heading of the
-         same or a higher level, as in `build_section_tree`), wherever it is. Reports have no
-         fixed order (acronyms before the introduction, references after each chapter), so a cut
-         there could lose real content.
+         paragraphs inside the Conclusions section), outside the first FRONT_LABEL_SHARE of the
+         body. None -> no cut. A cut and not a per-section drop, because a paper's back matter
+         runs to the end and its headings are often unlisted ("Downloads", "Submit your
+         manuscript...") or wrongly nested (paper_8).
+      3. drop_titles / drop_title_prefixes: drop each such section with its subsections (up to the
+         next heading of the same or a higher level, as in `build_section_tree`), wherever it is;
+         only its own text when the subsections would exceed DROP_MAX_SHARE of the document.
+         Reports have no fixed order (acronyms before the introduction, references after each
+         chapter), so a cut there could lose real content.
     Returns the kept pieces and what was cut (stored as meta.body, to audit a rule on a corpus).
     """
-    body: dict[str, Any] = {"start": None, "end": None, "dropped_sections": [], "chars_dropped": 0}
+    body: dict[str, Any] = {"start": None, "end": None, "dropped_sections": [], "dropped_own_text_only": [],
+                            "chars_dropped": 0}
     if rule is None:
         return pieces, body
     chars = sum(len(p.text) for p in pieces)
@@ -538,32 +599,50 @@ def select_body(pieces: list[Piece], rule: BodyRule | None) -> tuple[list[Piece]
             pieces = pieces[start:]
 
     if rule.end_titles:
+        front = FRONT_LABEL_SHARE * sum(len(p.text) for p in pieces)
+        seen = 0                             # chars of the body before piece i
         for i, p in enumerate(pieces):
             if p.type == "heading":
                 marker = p.text
-            elif p.type == "paragraph" and (m := _LEAD_LABEL.match(p.text)):
+            elif p.type == "paragraph" and seen >= front and (m := _LEAD_LABEL.match(p.text)):
                 marker = m.group(1)
             else:
-                continue
-            if title_matches(marker, rule.end_titles):
+                marker = None
+            if marker is not None and title_matches(marker, rule.end_titles):
                 body["end"] = marker
                 pieces = pieces[:i]
                 break
+            seen += len(p.text)
 
-    if rule.drop_titles:
+    if rule.drop_titles or rule.drop_title_prefixes:
+        total = sum(len(p.text) for p in pieces)
         kept: list[Piece] = []
         drop_level: int | None = None        # level of the section being dropped, if any
-        for p in pieces:
-            if p.type == "heading" and (drop_level is None or (p.level or 1) <= drop_level):
-                drop_level = (p.level or 1) if title_matches(p.text, rule.drop_titles) else None
-                if drop_level is not None:
+        own_text_only = False                # dropping only up to the next heading
+        for i, p in enumerate(pieces):
+            if p.type == "heading" and (drop_level is None or own_text_only or (p.level or 1) <= drop_level):
+                drop_level, own_text_only = None, False
+                if title_matches(p.text, rule.drop_titles) or title_has_prefix(p.text, rule.drop_title_prefixes):
+                    drop_level = p.level or 1
                     body["dropped_sections"].append(p.text)
+                    if _subtree_chars(pieces, i) > DROP_MAX_SHARE * total:
+                        own_text_only = True
+                        body["dropped_own_text_only"].append(p.text)
             if drop_level is None:
                 kept.append(p)
         pieces = kept
 
     body["chars_dropped"] = chars - sum(len(p.text) for p in pieces)
     return pieces, body
+
+
+def _subtree_chars(pieces: list[Piece], i: int) -> int:
+    """Chars of the section that heading pieces[i] opens, subsections included: up to the next
+    heading of the same or a higher level."""
+    level = pieces[i].level or 1
+    j = next((k for k in range(i + 1, len(pieces))
+              if pieces[k].type == "heading" and (pieces[k].level or 1) <= level), len(pieces))
+    return sum(len(p.text) for p in pieces[i:j])
 
 
 def assemble_doc(doc_id: str, corpus: str, title: str, pieces: list[Piece],
@@ -678,6 +757,14 @@ def title_matches(title: str, titles: list[str]) -> bool:
     return title in wanted or (head in wanted and len(last) <= 4)
 
 
+def title_has_prefix(title: str, prefixes: list[str]) -> bool:
+    """Whether the first word of `title` (through `normalise_title`) is one of `prefixes`:
+    "Annex 2: Workshop agenda" and "Appendix A Consumer questionnaire" start with "annex" and
+    "appendix", which `title_matches` misses because of the description after the identifier."""
+    first = normalise_title(title).partition(" ")[0]
+    return bool(first) and first in {normalise_title(p) for p in prefixes}
+
+
 def is_skippable_section(section: Section, cfg: Config) -> bool:
     """True for References / Acknowledgements / TOC etc. (used by Q-A unit sampling, NOT chunking).
 
@@ -699,21 +786,29 @@ def parse_corpus(corpus: str, cfg: Config, limit: int | None = None) -> list[Pat
     - One failing PDF does not stop the corpus: its traceback goes to the stage log and it is
       listed in data/parsed/<corpus>/_failures.jsonl (rewritten every run, so it lists the
       failures of the LAST run; `.jsonl` keeps it out of the `*.json` glob of later stages).
+    - A JSON whose PDF is no longer in the corpus folder is deleted: later stages read every
+      `*.json` there, so a document taken out of the corpus would otherwise stay in it.
     """
     pdf_dir = cfg.paths.corpora[corpus]
     if not pdf_dir.is_dir():
         raise FileNotFoundError(f"corpus '{corpus}': folder {pdf_dir} not found")
-    pdfs = sorted(p for p in pdf_dir.iterdir() if p.suffix.lower() == ".pdf")[:limit]
+    all_pdfs = sorted(p for p in pdf_dir.iterdir() if p.suffix.lower() == ".pdf")
+    pdfs = all_pdfs[:limit]
     if not pdfs:
         raise FileNotFoundError(f"corpus '{corpus}': no PDFs in {pdf_dir}")
     out_dir = cfg.paths.data_dir / "parsed" / corpus
+    stems = {p.stem for p in all_pdfs}
+    for orphan in sorted(out_dir.glob("*.json")):
+        if orphan.stem not in stems:
+            log.warning("%s: its PDF is no longer in %s, deleting the parsed JSON", orphan.name, pdf_dir)
+            orphan.unlink()
 
     paths: list[Path] = []
     failures: list[dict[str, str]] = []
     cached = 0
     for i, pdf in enumerate(pdfs, start=1):
         out = out_dir / f"{pdf.stem}.json"
-        if _is_up_to_date(out, corpus, cfg):
+        if _is_up_to_date(out, corpus, cfg, pdf):
             paths.append(out)
             cached += 1
             continue
@@ -733,15 +828,28 @@ def parse_corpus(corpus: str, cfg: Config, limit: int | None = None) -> list[Pat
     return paths
 
 
-def _is_up_to_date(path: Path, corpus: str, cfg: Config) -> bool:
-    """Whether a cached JSON is what `parse_pdf` would produce now: same parser code
-    (PARSER_VERSION), Docling version, include_labels, heading_levels and body rule, and the
-    same OCR decision under the current thresholds. The first pass's ratios are stored, so a
-    threshold change only re-parses the PDFs whose decision flips. A missing or unreadable file
-    is never up to date."""
+def _md5(path: Path) -> str:
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def _is_up_to_date(path: Path, corpus: str, cfg: Config, pdf: Path) -> bool:
+    """Whether a cached JSON is what `parse_pdf` would produce now: the same PDF (its MD5, so a new
+    file under an old name, or one parsed while still being copied, is parsed again), parser code
+    (PARSER_VERSION), Docling version, include_labels, heading_levels, body rule and title
+    override, and the same OCR decision under the current thresholds. Both passes' ratios are
+    stored, so a threshold change only re-parses the PDFs whose decision flips (or that never had
+    the OCR pass the new thresholds ask for). A missing or unreadable file is never up to date."""
     try:
         meta = json.loads(path.read_text(encoding="utf-8"))["meta"]
-        wants_ocr = bool(text_layer_problems(meta["text_layer"]["auto"], cfg))
+        if meta.get("pdf_md5") != _md5(pdf):
+            return False
+        text_layer = meta["text_layer"]
+        if text_layer_problems(text_layer["auto"], cfg):
+            if "full_page" not in text_layer:
+                return False
+            ocr = "full_page" if ocr_helps(text_layer["auto"], text_layer["full_page"], cfg) else "auto"
+        else:
+            ocr = "auto"
     except (OSError, ValueError, KeyError, TypeError):
         return False
     rule = cfg.parsing.body.get(corpus)
@@ -750,7 +858,8 @@ def _is_up_to_date(path: Path, corpus: str, cfg: Config) -> bool:
             and meta.get("include_labels") == sorted(cfg.parsing.include_labels)
             and meta.get("heading_levels") == cfg.parsing.heading_levels
             and meta.get("body_rule") == (rule.model_dump() if rule else None)
-            and meta.get("ocr") == ("full_page" if wants_ocr else "auto"))
+            and meta.get("title_override") == title_overrides(cfg).get((corpus, path.stem))
+            and meta.get("ocr") == ocr)
 
 
 def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = None) -> None:

@@ -4,7 +4,7 @@ Why: the old `save_data_with_pickle` / `load_data_with_pickle` wrote *globals* i
 That is fragile (silent overwrites of globals, Python-version-dependent, not inspectable).
 JSONL is human-readable and diff-able; Parquet is compact for the per-question metric tables.
 
-Layout produced (see README):
+Layout produced (see docs/):
   data/parsed/<corpus>/<doc_id>.json
   data/chunks/<corpus>/<method>_<ovl>.jsonl
   data/qa/{raw,filtered,rejected}.jsonl

@@ -1,7 +1,8 @@
 """The report's tables, computed from the checked inputs (inputs.py). Each function returns a DataFrame
 (or a dict of them) and writes nothing; __init__.run writes them and report.py turns them into Markdown.
 
-Conventions: "setup" is a variant name (character_no_overlap, ...) or gold_passage; the retrieval
+Conventions: "setup" is a variant under its report name (fixed-size_no_overlap, ...; inputs.label) or
+gold_passage; the retrieval
 views use the primary embedder at k = retrieval.top_k unless they say otherwise; every interval is a
 bootstrap over questions (stats.py), and every comparison between setups is paired.
 """
@@ -17,7 +18,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kendalltau, spearmanr
 
-from chunkeval.analysis.inputs import Inputs, run_path
+from chunkeval.analysis.inputs import Inputs, label, run_path
 from chunkeval.analysis.stats import (TIE, detectable_difference, holm, paired_diff, paired_family, questions_needed,
                                       rng_for, summary_table, verdict)
 from chunkeval.core.schema import Config
@@ -167,7 +168,7 @@ def setup_comparisons(df: pd.DataFrame, metrics: list[str], against: str, others
 
 def retrieval_vs_baseline(inputs: Inputs, cfg: Config, docs: pd.Series) -> pd.DataFrame:
     """Each setup − the baseline on every span metric, at top_k and at the token budget (primary embedder)."""
-    base = cfg.analysis.baseline
+    base = label(cfg.analysis.baseline)
     df = inputs.retrieval[(inputs.retrieval["embedder"] == cfg.embedding.primary)
                           & inputs.retrieval["k_label"].isin([str(cfg.retrieval.top_k), "budget"])]
     return setup_comparisons(df, SPAN_METRICS, base, [s for s in inputs.setups if s != base], docs, cfg,
@@ -198,7 +199,7 @@ def per_document(inputs: Inputs, cfg: Config, questions: pd.DataFrame, g: pd.Dat
     """Per document: its questions, its share of the corpus's chunks (baseline chunker), and how its
     questions fare, averaged over the setups: span metrics at top_k; fc_recall and abstention over the
     retrieved setups, and fc_recall from the gold passage."""
-    base = cfg.analysis.baseline
+    base = label(cfg.analysis.baseline)
     rows = []
     for corpus in inputs.corpora:
         counts = inputs.chunks_per_doc[(corpus, base)]
@@ -297,7 +298,7 @@ def generation_means(g: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 
 def generation_vs_baseline(g: pd.DataFrame, inputs: Inputs, cfg: Config, docs: pd.Series) -> pd.DataFrame:
-    base = cfg.analysis.baseline
+    base = label(cfg.analysis.baseline)
     return setup_comparisons(g[g["setup"] != GOLD_PASSAGE], GEN_METRICS, base, [s for s in inputs.setups if s != base],
                              docs, cfg, ["corpus"])
 
@@ -472,8 +473,8 @@ BREAKDOWN_DIMENSIONS = ["question_type", "evidence_quotes", "evidence_length", "
 
 def breakdowns(inputs: Inputs, cfg: Config, questions: pd.DataFrame, g: pd.DataFrame | None) -> pd.DataFrame:
     """The main metrics per setup, split by question type, number of evidence quotes (1 vs 2+: where
-    chunk boundaries should matter most now that two-span units are off), evidence length (terciles
-    per corpus) and kind (single / two-span, only when both exist). Decided 2026-10-12: no split by
+    chunk boundaries should matter most), evidence length (terciles per corpus) and kind (single /
+    two-span, only when both exist; two-span units are on again since 2026-10-19). Decided 2026-10-12: no split by
     section (nearly one value per question). Cells under LOW_N questions are flagged `low_n`."""
     dims = [d for d in BREAKDOWN_DIMENSIONS if d != "kind" or questions["kind"].nunique() > 1]
     labels = questions.set_index("question_id")[dims]
@@ -515,7 +516,7 @@ def detectable_differences(sources: dict[str, pd.DataFrame], inputs: Inputs, cfg
     p-value of a family, with power stats.POWER. Also at n = ragas.sample_per_corpus, and the number
     of questions a difference of 0.05 would need. Use it to size the final run before paying for it.
     A sd of 0 means no question changed between the setups: nothing can be estimated from it."""
-    base = cfg.analysis.baseline
+    base = label(cfg.analysis.baseline)
     others = [s for s in inputs.setups if s != base]
     alpha = (1 - cfg.analysis.ci) / max(len(others), 1)
     planned = cfg.ragas.sample_per_corpus
@@ -551,7 +552,7 @@ def chunk_sizes(cfg: Config, corpora: list[str]) -> pd.DataFrame:
         path = cfg.paths.data_dir / "chunks" / corpus / "_size_stats.json"
         if path.exists():
             for setup, s in json.loads(path.read_text(encoding="utf-8")).items():
-                rows.append({"corpus": corpus, "setup": setup, **s})
+                rows.append({"corpus": corpus, "setup": label(setup), **s})
     return pd.DataFrame(rows)
 
 
@@ -567,7 +568,8 @@ def costs(cfg: Config) -> dict[str, Any]:
     path = run_path(cfg, "answer_summary.json")
     if path.exists():
         summary = json.loads(path.read_text(encoding="utf-8"))
-        out["generator"] = pd.DataFrame([{"corpus": c, "setup": s, **v} for c, by in summary.items() for s, v in by.items()])
+        out["generator"] = pd.DataFrame([{"corpus": c, "setup": label(s), **v} for c, by in summary.items()
+                                         for s, v in by.items()])
     return out
 
 

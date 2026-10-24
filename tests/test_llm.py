@@ -80,7 +80,7 @@ def test_openai_role(cfg):
     assert llm.base_url == "https://api.openai.com/v1"
     assert llm.concurrency == 1                    # sequential by default: 429 risk
     assert llm.context_length is None              # no truncation check for OpenAI
-    assert llm.reasoning_effort is None
+    assert llm.reasoning_effort == cfg.llm.judge.reasoning_effort
 
 
 def test_api_key_not_stored_on_object(cfg):
@@ -152,6 +152,7 @@ def test_chat_sends_role_settings(cfg):
 
 def test_chat_omits_unset_optional_params(cfg):
     """Non-reasoning OpenAI models reject `reasoning_effort`; max_tokens=None means no limit."""
+    cfg.llm.judge.reasoning_effort = None          # as for a non-reasoning judge
     llm = ChatLLM("judge", cfg, SECRETS); fake = with_fake(llm)
     llm.chat(MSGS)
     assert "reasoning_effort" not in fake.calls[0] and "max_tokens" not in fake.calls[0]
@@ -183,6 +184,24 @@ def test_chat_context_overflow_raises(cfg):
     fake.respond = lambda p: fake_response("", finish="length", prompt_tokens=8191, completion_tokens=1)
     with pytest.raises(LLMOutputError, match="context window full"):   # not the "cut off" message
         llm.chat(MSGS)
+
+
+@pytest.mark.parametrize("prompt_tokens, completion_tokens", [
+    (4098, 8),          # Ollama 0.40.6 cuts an over-long prompt to half the window, reply ends normally
+    (4096, 0),          # exactly half: counts as truncated, since the two can't be told apart
+    (3500, 4692),       # a prompt that fits, but the reply fills the window
+])
+def test_chat_truncated_prompt_raises(cfg, prompt_tokens, completion_tokens):
+    llm = ChatLLM("rag_generator", cfg, SECRETS); fake = with_fake(llm)
+    fake.respond = lambda p: fake_response("ok", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    with pytest.raises(LLMOutputError, match="context window full"):
+        llm.chat(MSGS)
+
+
+def test_chat_prompt_under_half_the_window_passes(cfg):
+    llm = ChatLLM("rag_generator", cfg, SECRETS); fake = with_fake(llm)
+    fake.respond = lambda p: fake_response("ok", prompt_tokens=cfg.ollama.context_length // 2 - 1, completion_tokens=500)
+    assert llm.chat(MSGS).text == "ok"
 
 
 def test_no_overflow_check_for_openai(cfg):
@@ -307,8 +326,10 @@ def test_live_check_ollama(live):
         r = report[_ollama_tag(llm.model)]
         assert r["quantization_level"] and len(r["digest"]) == 64
         assert r["context_length"] >= live.cfg.ollama.context_length
-        if role != "qa_critic":                     # a dense generator must never be split with the CPU
-            assert r["gpu_share"] == 1.0, f"{llm.model} only {r['gpu_share']:.0%} on GPU"
+        # A dense generator must never be split with the CPU. For Gemma that takes the derived tag of
+        # ollama/gemma4-allgpu.Modelfile: the official one keeps a layer on the CPU (99.5%).
+        if role != "qa_critic":
+            assert r["gpu_share"] == 1.0, f"{llm.model} only {r['gpu_share']:.1%} on GPU"
     assert _loaded(live.secrets.ollama_base_url) == []          # each model unloaded after its check
 
 
@@ -401,7 +422,7 @@ def test_live_unload(live):
 
 @pytest.mark.openai
 def test_live_openai_judge_snapshot_exists(cfg):
-    """Key is valid and the pinned snapshot hasn't been retired — check before an eval run."""
+    """Key is valid and the judge model hasn't been retired — check before an eval run."""
     secrets = load_secrets()
     if secrets.openai_api_key is None:
         pytest.skip("OPENAI_API_KEY not set")
