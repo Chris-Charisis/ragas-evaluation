@@ -132,7 +132,7 @@ For only some of the existing corpora, an overlay leaves the others out (`paths.
 
 A corpus left out of a config is still in `data/`: `filter-qa` carries its lines over, its collections stay, and `parse` keeps its doc ids reserved. Adding it back costs nothing.
 
-**4. A smoke test of the whole chain on a few documents.** `configs/smoke.yaml` gives it a workspace of its own: `data/smoke/`, `runs/smoke/` and the collections `Smoke_*`. Nothing of `data/` or of another run is touched; only the LLM caches are shared. `parse --limit` picks the documents, and every later stage takes all of them:
+**4. A smoke test of the whole chain on a few documents.** `configs/smoke.yaml` gives it a workspace of its own: `data/smoke/`, `runs/smoke/` and the collections `Smoke_*`. Nothing of `data/` or of another run is touched; only the answer and judge caches (`data/llm_cache/`) are shared. The questions and the critic's scores belong to the workspace, so `gen-qa` and `filter-qa` ask the local models again. `parse --limit` picks the documents, and every later stage takes all of them:
 ```bash
 C="--config configs/smoke.yaml"
 uv run chunkeval parse $C --limit 2      # the first 2 PDFs of each corpus
