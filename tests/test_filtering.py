@@ -8,7 +8,7 @@ import jsonschema
 import numpy as np
 import pytest
 
-from chunkeval.core.llm import LLMOutputError, LLMResult
+from chunkeval.core.llm import ContextOverflowError, LLMOutputError, LLMResult
 from chunkeval.core.store import read_jsonl, run_dir, write_json, write_jsonl
 from chunkeval.qa import filtering
 from chunkeval.qa.filtering import (CRITERIA, CRITIC_PROMPT_PATH, build_critic_messages, critic_json_schema,
@@ -382,11 +382,16 @@ def test_run_resumes_from_the_cache(stage):
     assert len(critic.calls) == 8
 
 
-def test_run_api_error_writes_nothing(stage):
+@pytest.mark.parametrize("error", [
+    ConnectionError("down"),
+    # depends on the server's window, which no cache key holds: never cached, asked again once it is raised
+    ContextOverflowError("[qa_critic] context window full"),
+])
+def test_run_api_error_writes_nothing(stage, error):
     """A pair without an answer stops the stage before anything is written; the answers that came
     are cached, and the re-run asks only the missing ones."""
     cfg, critic, pairs = stage
-    critic.respond = lambda call, user, schema: (ConnectionError("down") if "generic" in user
+    critic.respond = lambda call, user, schema: (error if "generic" in user
                                                  else strict_on_generic(call, user, schema))
     with pytest.raises(RuntimeError, match="re-run `chunkeval filter-qa`"):
         run(cfg, None, corpora=["papers"])

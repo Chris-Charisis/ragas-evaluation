@@ -289,7 +289,8 @@ def critic_scores(pairs: list[QAPair], docs: dict[tuple[str, str], "CanonicalDoc
     answer, so it is kept, not asked again), "prompt_tokens", "completion_tokens"}. New records go
     to `on_record` as soon as they arrive, so a crash loses only the requests in flight. One batch
     per call and schema (a two-span pair's passage call adds needs_both). A request that failed
-    (timeout, server down) gives no record: nothing to cache, the next run asks it again.
+    (timeout, server down, a prompt over the context window) gives no record: nothing to cache, the
+    next run asks it again.
     Keeps the keep/drop decision OUT of this function (see `decide`).
     """
     records: dict[tuple[str, str], dict[str, Any]] = {}
@@ -596,8 +597,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
     Every pair that passes is kept (no final down-sampling). The critic is asked only about pairs
     that passed the checks, and only when its answer isn't cached (see the module docstring); then
     it is unloaded, because bge-m3 needs the GPU for the questions the de-duplication hasn't encoded
-    yet. Pairs without an answer (API errors) stop the stage before anything is written: a re-run
-    asks exactly those. Ends with the filter settings of `corpora` (filtered.provenance.json),
+    yet. Pairs without an answer (API errors, prompts over the context window) stop the stage
+    before anything is written: a re-run asks exactly those. Ends with the filter settings of `corpora` (filtered.provenance.json),
     `summarize` (logged and written to runs/<run_id>/filter_qa_summary.json) and, the first time, a
     sample of this run's pairs for hand labelling (runs/<run_id>/filter_qa_labelling.csv).
     The CLI already ran `check_ollama` before this and unloads the critic afterwards.
@@ -639,8 +640,9 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
     if llm.provider == "ollama":
         unload_ollama_model(llm.base_url, llm.model)
     if api_errors:
-        raise RuntimeError(f"{api_errors} pair(s) got no answer from the critic (API errors, see the warnings "
-                           f"above); nothing written: re-run `chunkeval filter-qa` to ask them again")
+        raise RuntimeError(f"{api_errors} pair(s) got no answer from the critic (API errors, or prompts over the "
+                           f"context window: see the warnings above); nothing written: re-run `chunkeval filter-qa` "
+                           f"to ask them again")
 
     # 3. The decision, on the two calls' outputs merged (notes and scores).
     passed = []

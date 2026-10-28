@@ -41,11 +41,25 @@ class LLMResult:
 
 
 class LLMOutputError(RuntimeError):
-    """The model answered, but the answer can't be used (cut off, context overflow, bad JSON).
+    """The model answered, but the answer can't be used (cut off at max_tokens, bad JSON).
 
     Separate from API errors so callers can count and log these per item instead of
-    stopping the whole run.
+    stopping the whole run. The same request with the same settings gives the same answer, so
+    callers cache it as final.
     """
+
+
+class ContextOverflowError(RuntimeError):
+    """The prompt didn't fit the server's context window, so it was probably truncated.
+
+    Not an LLMOutputError: it depends on OLLAMA_CONTEXT_LENGTH, which no cache key holds, so a cached
+    one would be served again after the window is raised. Callers treat it like an API error instead:
+    not cached, the stage stops at the end, and the re-run asks it again.
+    """
+
+
+# `chat_many` warns when its largest prompt reaches this share of the prompt budget (half the window).
+PROMPT_WARN_SHARE = 0.8
 
 
 def _parse_json(text: str, schema: dict[str, Any], role: str) -> dict[str, Any]:
@@ -241,6 +255,12 @@ class ChatLLM:
         # errors, timeouts, 429 and 5xx with exponential backoff — `chat_many` relies on that.
         self.client = OpenAI(base_url=self.base_url, api_key=api_key, timeout=300, max_retries=3)
 
+    @property
+    def prompt_budget(self) -> int | None:
+        """The longest prompt `chat` accepts: half the context window (pitfall 1 in `chat`); None
+        without a window to check (OpenAI)."""
+        return self.context_length // 2 if self.context_length else None
+
     def chat(self, messages: list[dict[str, str]], json_schema: dict | None = None,
              **overrides: Any) -> LLMResult:
         """Send one chat completion.
@@ -250,8 +270,8 @@ class ChatLLM:
         only (e.g. `temperature=0.3`); they win over the role's config.
 
         Raises `LLMOutputError` when the model answered but the answer can't be used (cut off,
-        context overflow, invalid JSON). API errors (timeouts, 5xx) come from the `openai` SDK
-        after its own retries.
+        invalid JSON), and `ContextOverflowError` when the prompt didn't fit the window. API errors
+        (timeouts, 5xx) come from the `openai` SDK after its own retries.
 
         Behaviour measured on Ollama 0.30.4 (qwen3.5:9b-q8_0, gpt-oss:20b), re-checked on 0.40.6
         (2026-10-19, also gemma4:12b-it-q8_0) — re-check after upgrades:
@@ -261,7 +281,7 @@ class ChatLLM:
              12k tokens; the log says "truncating input prompt", the reply nothing), keeping only
              its first 5 tokens, so the system message is lost again. Native /api/chat refuses
              instead with `truncate: false`, but /v1 ignores that option. Detected below from
-             `usage`: a prompt of half the window or more counts as truncated.
+             `usage`: a prompt of half the window or more counts as truncated (ContextOverflowError).
           2. THINKING: by default Qwen3.5 thinks first and spent all 400 max_tokens on it — empty
              content, finish_reason "length". On /v1 only `reasoning_effort="none"` turns it off
              (`think: false` in extra_body and Qwen's `/no_think` are ignored). Thinking goes to a
@@ -298,11 +318,10 @@ class ChatLLM:
         # Pitfall 1. Checked before "length" below, because an overflow also ends with "length"
         # and this is the more useful message. A truncated prompt reports half the window (0.40.6)
         # or all of it (0.30.4), so half the window is the usable prompt budget. Largest prompts on
-        # the dev docs: 2,166 tokens (answer), 1,410 (critic), ~1,500 (gen-qa); at most 5 chunks of
-        # 512 tokens + instructions, ~3,100.
-        if self.context_length and (prompt_tokens >= self.context_length // 2
+        # the full corpus: 3,607 tokens (answer, 88% of an 8192 window's budget), 1,449 (critic).
+        if self.context_length and (prompt_tokens >= self.prompt_budget
                                     or prompt_tokens + completion_tokens >= self.context_length):
-            raise LLMOutputError(
+            raise ContextOverflowError(
                 f"[{self.role}] context window full ({prompt_tokens} prompt + {completion_tokens} "
                 f"output tokens; window {self.context_length}, prompts must stay under half of it): "
                 f"the prompt was probably truncated and its start (the system message) lost. "
@@ -343,6 +362,9 @@ class ChatLLM:
         `on_result(index, result)`: called as soon as each request finishes, in completion order,
         always from the calling thread (so it's safe to append to a file there). Use it with
         `store.append_jsonl` so a crash keeps every finished item, not just finished batches.
+
+        Warns when the batch's largest prompt reaches PROMPT_WARN_SHARE of `prompt_budget`: the
+        prompts are about to outgrow the window, and the first one that does stops its stage.
         """
         concurrency = concurrency or self.concurrency
         results: list[LLMResult | Exception | None] = [None] * len(batch)
@@ -376,9 +398,15 @@ class ChatLLM:
         elapsed = time.monotonic() - start
         ok = [r for r in results if isinstance(r, LLMResult)]
         out_tokens = sum(r.completion_tokens for r in ok)
-        log.info("[%s] %d/%d ok in %.0fs — %d output tokens, %.1f tokens/s, concurrency %d",
+        largest = max((r.prompt_tokens for r in ok), default=0)
+        log.info("[%s] %d/%d ok in %.0fs — %d output tokens, %.1f tokens/s, concurrency %d, largest prompt %d tokens",
                  self.role, len(ok), len(batch), elapsed, out_tokens,
-                 out_tokens / elapsed if elapsed else 0.0, concurrency)
+                 out_tokens / elapsed if elapsed else 0.0, concurrency, largest)
+        budget = self.prompt_budget
+        if budget and largest >= PROMPT_WARN_SHARE * budget:
+            log.warning("[%s] the largest prompt has %d tokens, %.0f%% of the %d-token prompt budget (half the "
+                        "context window): raise OLLAMA_CONTEXT_LENGTH and ollama.context_length before the prompts "
+                        "grow further", self.role, largest, 100 * largest / budget, budget)
         return results  # type: ignore[return-value]   # every slot is filled by now
 
 

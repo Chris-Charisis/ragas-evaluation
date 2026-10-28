@@ -8,6 +8,7 @@ the service is unavailable:
   - `openai`: only free metadata calls (key valid, judge snapshots not retired).
 Fast run: pytest -m "not ollama and not openai"
 """
+import math
 import threading
 import time
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ import requests
 
 from chunkeval.core import store
 from chunkeval.core.config import Secrets, load_secrets
-from chunkeval.core.llm import (ChatLLM, LLMOutputError, LLMResult, _native_url, _ollama_tag,
+from chunkeval.core.llm import (ChatLLM, ContextOverflowError, LLMOutputError, LLMResult, _native_url, _ollama_tag,
                            _parse_json, check_ollama, unload_ollama_model)
 
 SECRETS = Secrets(openai_api_key="sk-test-not-real", ollama_base_url="http://localhost:11434/v1")
@@ -182,8 +183,11 @@ def test_chat_json_invalid_raises(cfg):
 def test_chat_context_overflow_raises(cfg):
     llm = ChatLLM("rag_generator", cfg, SECRETS); fake = with_fake(llm)
     fake.respond = lambda p: fake_response("", finish="length", prompt_tokens=8191, completion_tokens=1)
-    with pytest.raises(LLMOutputError, match="context window full"):   # not the "cut off" message
+    with pytest.raises(ContextOverflowError, match="context window full") as e:   # not the "cut off" message
         llm.chat(MSGS)
+    # Not an unusable output, which the stages cache as final: the window is a server setting no cache
+    # key holds, so the stages must ask again once it is raised.
+    assert not isinstance(e.value, LLMOutputError)
 
 
 @pytest.mark.parametrize("prompt_tokens, completion_tokens", [
@@ -194,7 +198,7 @@ def test_chat_context_overflow_raises(cfg):
 def test_chat_truncated_prompt_raises(cfg, prompt_tokens, completion_tokens):
     llm = ChatLLM("rag_generator", cfg, SECRETS); fake = with_fake(llm)
     fake.respond = lambda p: fake_response("ok", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-    with pytest.raises(LLMOutputError, match="context window full"):
+    with pytest.raises(ContextOverflowError, match="context window full"):
         llm.chat(MSGS)
 
 
@@ -252,6 +256,19 @@ def test_chat_many_order_errors_and_callback(cfg):
     assert isinstance(results[2], LLMOutputError) and isinstance(results[4], RuntimeError)
     assert sorted(i for i, _ in seen) == [0, 1, 2, 3, 4]
     assert all(t is threading.main_thread() for _, t in seen)     # safe to append to a file there
+
+
+@pytest.mark.parametrize("share, warned", [(0.79, False), (0.8, True), (0.95, True)])
+def test_chat_many_warns_near_the_prompt_budget(cfg, caplog, share, warned):
+    """The largest prompt of a batch at PROMPT_WARN_SHARE of the budget (half the window) or more is
+    warned about, before a longer one stops a stage."""
+    llm = ChatLLM("rag_generator", cfg, SECRETS); fake = with_fake(llm)
+    largest = math.ceil(share * llm.prompt_budget)
+    fake.respond = lambda p: fake_response(prompt_tokens=int(p["messages"][0]["content"]))
+    with caplog.at_level("INFO"):
+        llm.chat_many([[{"role": "user", "content": str(n)}] for n in (10, largest, 50)])
+    assert f"largest prompt {largest} tokens" in caplog.text
+    assert ("prompt budget" in caplog.text) == warned
 
 
 def test_chat_many_respects_concurrency(cfg):
@@ -364,7 +381,7 @@ def test_live_deterministic(live):
 @pytest.mark.ollama
 def test_live_context_overflow_detected(live):
     """Pins pitfall 1: Ollama truncates an over-long prompt silently; `chat` must notice."""
-    with pytest.raises(LLMOutputError, match="context window full"):
+    with pytest.raises(ContextOverflowError, match="context window full"):
         live.clients["rag_generator"].chat([{"role": "user", "content": "word " * 12000}])
 
 

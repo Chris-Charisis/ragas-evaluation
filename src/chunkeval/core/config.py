@@ -213,9 +213,10 @@ def load_config(path: str | Path) -> Config:
 
 # Settings that can't change a result, only how fast or how far a stage goes, what `eval`
 # estimates it costs, or where the run folders are: changing one under the same run_id changes
-# nothing the run measured.
-UNGUARDED = ("paths.runs_dir", "ollama.concurrency", "ragas.max_workers", "ragas.timeout", "ragas.max_retries",
-             "ragas.max_cost_usd", "ragas.prices")
+# nothing the run measured. ollama.context_length only decides whether a prompt fits: one that
+# doesn't is never stored (llm.ContextOverflowError).
+UNGUARDED = ("paths.runs_dir", "ollama.concurrency", "ollama.context_length", "ragas.max_workers", "ragas.timeout",
+             "ragas.max_retries", "ragas.max_cost_usd", "ragas.prices")
 
 
 class ConfigChanged(RuntimeError):

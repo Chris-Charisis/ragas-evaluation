@@ -107,7 +107,8 @@ class DroppedUnit:
     kind: str
     # skip: the model declined; bad_output: LLMOutputError (invalid JSON, cut off...);
     # quote_not_found: a quote `locate_quote` can't find; two_span_one_side: a two-span unit with
-    # located quotes in only one span; api_error: no answer (timeout, server down), retried next run.
+    # located quotes in only one span; api_error: no answer (timeout, server down, a prompt over the
+    # context window), retried next run.
     reason: Literal["skip", "bad_output", "quote_not_found", "two_span_one_side", "api_error"]
     detail: str
     generator_model: str = ""
@@ -728,7 +729,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
     as it is final, so a crash or Ctrl+C loses only the units in flight. A re-run resumes: a unit
     already in either file is not asked again, as long as `check_provenance` passes; `recreate`
     starts `corpora` over, and leaves the other corpora's records alone. Units without an answer
-    (API errors) are not saved: the stage fails at the end, and a re-run asks them again.
+    (API errors, prompts over the context window) are not saved: the stage fails at the end, and a
+    re-run asks them again.
 
     Generates more than the final set needs (filtering drops 40–60%); filter-qa samples down.
     The CLI already ran `check_ollama` before this and unloads the generator afterwards.
@@ -777,5 +779,5 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
                  two["cross_section"]["pairs"], two["cross_section"]["units"])
     write_json(run_dir(cfg) / "gen_qa_summary.json", summary)
     if api_errors:
-        raise RuntimeError(f"{api_errors} unit(s) got no answer (API errors, see the warnings above) and were "
-                           f"not saved: re-run `chunkeval gen-qa` to ask them again")
+        raise RuntimeError(f"{api_errors} unit(s) got no answer (API errors, or prompts over the context window: "
+                           f"see the warnings above) and were not saved: re-run `chunkeval gen-qa` to ask them again")

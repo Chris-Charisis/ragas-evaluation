@@ -122,7 +122,7 @@ class Answer:
     chunk_ids: list[str]      # their chunk ids, in rank order (empty for the gold passage)
     evidence_shown: bool      # some passage overlaps the gold evidence
     abstained: bool           # `is_abstention(response)`
-    error: str | None         # why the answer is unusable (cut off at max_tokens, context full), else None
+    error: str | None         # why the answer is unusable (cut off at max_tokens, invalid output), else None
     model: str
     prompt_tokens: int
     completion_tokens: int
@@ -270,8 +270,8 @@ def ask(todo: dict[str, tuple[str, str, list[dict[str, str]]]], llm: ChatLLM,
     once), "model", "response", "error": None or why the answer is unusable (LLMOutputError: the same
     request at temperature 0 gives the same answer, so it is kept, not asked again),
     "prompt_tokens", "completion_tokens"}. Each goes to `on_record` as soon as it arrives, so a crash
-    loses only the requests in flight. A request that failed (timeout, server down) gives no
-    record: nothing to cache, the next run asks it again.
+    loses only the requests in flight. A request that failed (timeout, server down, a prompt over
+    the context window) gives no record: nothing to cache, the next run asks it again.
     """
     keys = list(todo)
     records: dict[str, dict[str, Any]] = {}
@@ -369,8 +369,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
 
     Everything the generator will be shown is assembled and checked first (documents, retrieval
     files), so a stale input stops the stage before any LLM call. Then only the answers the cache
-    doesn't hold are asked. Answers without a result (API errors) stop the stage before any answer
-    file is written: a re-run asks exactly those. The CLI already ran `check_ollama` before this
+    doesn't hold are asked. Answers without a result (API errors, prompts over the context window)
+    stop the stage before any answer file is written: a re-run asks exactly those. The CLI already ran `check_ollama` before this
     and unloads the generator afterwards.
     """
     questions = load_questions(cfg)
@@ -413,8 +413,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
     new, api_errors = ask(todo, llm, on_record=lambda record: append_jsonl(cache_path, record))
     cache.update(new)
     if api_errors:
-        raise RuntimeError(f"{api_errors} question(s) got no answer (API errors, see the warnings above); no answer "
-                           f"file written: re-run `chunkeval answer` to ask them again")
+        raise RuntimeError(f"{api_errors} question(s) got no answer (API errors, or prompts over the context window: "
+                           f"see the warnings above); no answer file written: re-run `chunkeval answer` to ask them again")
 
     # 3. The answer files, rewritten from the cache. Abstentions are marked here, not cached, so a
     # change to `is_abstention` applies without asking anything again.

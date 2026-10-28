@@ -9,7 +9,7 @@ import json
 import pytest
 
 from chunkeval.core.config import Secrets
-from chunkeval.core.llm import LLMOutputError, LLMResult
+from chunkeval.core.llm import ContextOverflowError, LLMOutputError, LLMResult
 from chunkeval.core.store import read_jsonl, run_dir, write_jsonl
 from chunkeval.evaluation import answering
 from chunkeval.evaluation.answering import (ABSTENTION_PHRASE, GOLD_PASSAGE, PROMPT_PATH, answer_cache_path,
@@ -231,9 +231,14 @@ def test_stale_retrieval_is_refused(answers):
     assert generator.asked == []
 
 
-def test_api_error_writes_nothing_and_the_rerun_asks_only_it(answers):
+@pytest.mark.parametrize("error", [
+    RuntimeError("timeout"),
+    # depends on the server's window, which no cache key holds: never cached, asked again once it is raised
+    ContextOverflowError("[rag_generator] context window full"),
+])
+def test_api_error_writes_nothing_and_the_rerun_asks_only_it(answers, error):
     cfg, generator, pairs = answers
-    generator.respond = lambda user: RuntimeError("timeout") if pairs[0].question in user else replicates_or_abstain(user)
+    generator.respond = lambda user: error if pairs[0].question in user else replicates_or_abstain(user)
     with pytest.raises(RuntimeError, match=r"2 question\(s\) got no answer"):
         answer(cfg)
     assert not answer_path(cfg, "papers", VARIANT).exists() and not answer_path(cfg, "papers", GOLD_PASSAGE).exists()

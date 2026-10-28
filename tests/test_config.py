@@ -206,9 +206,11 @@ def test_a_changed_setting_is_refused_until_accepted(cfg):
 def test_settings_that_cant_change_a_result_are_not_guarded(cfg, caplog):
     save_config(cfg)
     cfg.ragas.max_workers, cfg.ragas.max_cost_usd, cfg.ollama.concurrency = 8, 500, 4
+    cfg.ollama.context_length = 16384               # only whether a prompt fits: an overflow is never stored
     with caplog.at_level("INFO"):
         save_config(cfg)
-    assert "can't change a result: ollama.concurrency: 2 -> 4; ragas.max_cost_usd" in caplog.text
+    assert ("can't change a result: ollama.concurrency: 2 -> 4; ollama.context_length: 8192 -> 16384; "
+            "ragas.max_cost_usd") in caplog.text
     assert history(cfg) == [] and yaml.safe_load(record(cfg).read_text(encoding="utf-8"))["ragas"]["max_workers"] == 8
 
 

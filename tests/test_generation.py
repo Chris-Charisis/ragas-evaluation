@@ -11,7 +11,7 @@ import jsonschema
 import numpy as np
 import pytest
 
-from chunkeval.core.llm import LLMOutputError, LLMResult
+from chunkeval.core.llm import ContextOverflowError, LLMOutputError, LLMResult
 from chunkeval.core.schema import QA as QAConfig
 from chunkeval.core.schema import REPO_ROOT
 from chunkeval.core.store import read_jsonl, run_dir, write_json, write_jsonl
@@ -365,6 +365,8 @@ def test_generate_skips_done_units(tiny_doc, small_cfg):
      "quote_not_found"),
     (lambda user: LLMOutputError("[qa_generator] answer is not valid JSON"), "bad_output"),
     (lambda user: ConnectionError("server down"), "api_error"),
+    # depends on the server's window, not on the request: never saved, asked again once it is raised
+    (lambda user: ContextOverflowError("[qa_generator] context window full"), "api_error"),
 ])
 def test_generate_drop_reasons(tiny_doc, small_cfg, respond, reason):
     """Each failure becomes a DroppedUnit with its reason and the unit's details."""

@@ -66,7 +66,7 @@ abstention as relevancy 0 (noncommittal) and factual correctness 0, and its fait
     abstentions = 1 (an abstention makes no unsupported claim), in analysis.py;
   - abstentions are never dropped from every metric: a setup that abstains on its hard questions would
     look better on the rest, and the paired comparison needs the same questions in every setup.
-Answers with `error` set (cut off, context full) have no response: their response metrics are NaN. The
+Answers with `error` set (cut off at max_tokens) have no response: their response metrics are NaN. The
 summary counts every NaN per metric and setup.
 
 Ragas 0.2.x sends usage events to its developers unless RAGAS_DO_NOT_TRACK is set: set below, before
