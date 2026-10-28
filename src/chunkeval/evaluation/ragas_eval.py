@@ -614,9 +614,12 @@ def setups(cfg: Config) -> list[tuple[str | None, bool | None, str]]:
 def load_corpus_answers(cfg: Config, corpus: str, pairs: list[QAPair]) -> dict[str, dict[str, Answer]]:
     """setup -> question_id -> Answer for a corpus's whole question set `pairs`. Refuses an answer file
     that is missing or was made for other questions, retrieval, top_k, document titles or answer prompt
-    than the current ones (what `chunkeval answer` would redo), so no row scores an answer to something else."""
+    than the current ones, or by another generator (what `chunkeval answer` would redo), so no row scores
+    an answer to something else, or the answer of a generator the run no longer names. The generator is
+    compared on its settings (answering.generator_settings), not its Ollama digest: `eval` needs no Ollama."""
     prompt_sha = answering.prompt_sha256(cfg)
     titles_sha = answering.titles_sha256(answering.doc_titles(cfg, corpus))
+    generator = {k: v for k, v in answering.generator_settings(cfg, None).items() if k != "digest"}
     by_setup = {}
     for method, overlap, setup in setups(cfg):
         path = answer_path(cfg, corpus, setup)
@@ -631,6 +634,11 @@ def load_corpus_answers(cfg: Config, corpus: str, pairs: list[QAPair]) -> dict[s
         if not current:
             raise RuntimeError(f"{path} is missing or older than the current questions, retrieval, document "
                                f"titles or answer prompt: run `chunkeval answer` first")
+        made_by = {k: v for k, v in (stored.get("generator") or {}).items() if k != "digest"}
+        if made_by != generator:
+            differs = sorted(k for k in made_by.keys() | generator.keys() if made_by.get(k) != generator.get(k))
+            raise RuntimeError(f"{path} was answered by another generator ({', '.join(differs)} differ from the "
+                               f"config's): run `chunkeval answer` first")
         by_setup[setup] = {a.question_id: a for a in load_answers(path)}
     return by_setup
 

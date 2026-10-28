@@ -254,6 +254,14 @@ def gold_passage(qa: QAPair, doc: "CanonicalDoc") -> Shown:
 
 # --- the generator --------------------------------------------------------------------------------
 
+def generator_settings(cfg: Config, digest: str | None) -> dict[str, Any]:
+    """Everything besides the messages that decides an answer: the generator's model and settings, the
+    seed, ANSWER_VERSION and its Ollama digest (None for OpenAI, where the model name is the pin). Part
+    of every `answer_key`, recorded with the answer files, and compared by `eval` without the digest
+    (ragas_eval.load_corpus_answers), so `eval` needs no Ollama."""
+    return {**cfg.llm.rag_generator.model_dump(), "seed": cfg.seed, "version": ANSWER_VERSION, "digest": digest}
+
+
 def answer_key(messages: list[dict[str, str]], generator: dict[str, Any]) -> str:
     """sha256 of everything that decides an answer: the messages (prompt, passages, question) and
     `generator` (model, settings, Ollama digest, seed, ANSWER_VERSION)."""
@@ -396,8 +404,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
 
     # 2. The generator, asked only what the cache doesn't hold.
     llm = ChatLLM("rag_generator", cfg, secrets)
-    generator = {**cfg.llm.rag_generator.model_dump(), "seed": cfg.seed, "version": ANSWER_VERSION,
-                 "digest": ollama_model_digest(llm.base_url, llm.model) if llm.provider == "ollama" else None}
+    generator = generator_settings(cfg, ollama_model_digest(llm.base_url, llm.model) if llm.provider == "ollama"
+                                   else None)
     cache_path = answer_cache_path(cfg)
     cache = {r["key"]: r for r in read_jsonl(cache_path)} if cache_path.exists() else {}
     keys: dict[tuple[str, str, str], str] = {}          # (corpus, setup, question_id) -> answer key

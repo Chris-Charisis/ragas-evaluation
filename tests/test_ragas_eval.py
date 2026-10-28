@@ -422,6 +422,17 @@ def test_stale_answers_are_refused(evaluated):
     assert client.prompts == []
 
 
+def test_answers_of_another_generator_are_refused(evaluated):
+    """A generator setting changed (with --accept-config) but `answer` not re-run: the answer files are
+    the old generator's, so the judge is asked nothing. Its Ollama digest isn't compared (`eval` needs no
+    Ollama), so the fake digest the answers were made with passes."""
+    cfg, client = evaluated
+    cfg.llm.rag_generator.temperature = 0.7
+    with pytest.raises(RuntimeError, match=r"another generator \(temperature differ.*run `chunkeval answer` first"):
+        evaluate(cfg)
+    assert client.prompts == []
+
+
 def test_answers_shown_another_title_are_refused(evaluated):
     """A retitled document leaves the chunks and the retrieval as they were, but not what the answers
     were made from."""
