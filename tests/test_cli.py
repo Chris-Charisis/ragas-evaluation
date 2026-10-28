@@ -40,7 +40,7 @@ def ollama(monkeypatch):
     """Stub out the Ollama preflight and unload; record what was called."""
     from chunkeval.core import llm
     events: list[tuple] = []
-    monkeypatch.setattr(llm, "check_ollama", lambda cfg, url: events.append(("check", url)))
+    monkeypatch.setattr(llm, "check_ollama", lambda cfg, url, roles: events.append(("check", tuple(roles))))
     monkeypatch.setattr(llm, "unload_ollama_model", lambda url, model: events.append(("unload", model)))
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     return events
@@ -202,7 +202,7 @@ def test_main_missing_secret_stops_before_any_work(config_file, calls, monkeypat
 
 def test_main_llm_stage_preflight_and_unload(config_file, calls, ollama):
     cli.main(["gen-qa", "--config", str(config_file), "--corpus", "papers"])
-    assert ollama[0][0] == "check"                           # preflight before the stage
+    assert ollama[0] == ("check", ("qa_generator",))         # preflight before the stage, on its own model only
     assert calls and calls[0]["options"] == {"corpora": ["papers"], "limit": None, "recreate": False}
     assert ollama[-1][0] == "unload"                         # GPU freed after it
 

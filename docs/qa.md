@@ -7,7 +7,7 @@ stage evaluates (`data/qa/filtered.jsonl`).
 ## Q-A generation (`gen-qa`)
 
 ```bash
-uv run chunkeval gen-qa --corpus papers --limit 1   # smoke test: one paper, ~20 s after the ~25 s Ollama preflight
+uv run chunkeval gen-qa --corpus papers --limit 1   # smoke test: one paper, ~20 s after the Ollama preflight
 uv run chunkeval gen-qa                             # every corpus; resumes where an earlier run stopped
 uv run chunkeval gen-qa --corpus papers --recreate  # delete the papers records only and start papers over
 ```

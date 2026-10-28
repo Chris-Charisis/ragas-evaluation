@@ -382,7 +382,7 @@ uv run chunkeval index --recreate
 
 ### 8.6 Q-A generation
 
-A smoke test first (~1 min including the ~25 s Ollama preflight); the full run resumes it:
+A smoke test first (~1 min including the Ollama preflight); the full run resumes it:
 
 ```bash
 uv run chunkeval gen-qa --corpus papers --limit 1

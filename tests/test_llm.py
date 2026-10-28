@@ -300,6 +300,45 @@ def test_chat_many_interrupt_cancels_queued(cfg):
     assert len(fake.calls) <= 2 * cfg.ollama.concurrency      # the queued ones never ran
 
 
+def test_check_ollama_checks_only_the_given_roles_and_merges_the_record(cfg, monkeypatch):
+    """The preflight loads only the models of the roles it is given: another stage's model needn't
+    even be pulled. Each check updates its own models' lines of ollama_models.jsonl and keeps the
+    others, so the file holds every model the run used. A role on OpenAI asks Ollama nothing."""
+    from chunkeval.core import llm as llm_module
+
+    generator, critic = _ollama_tag(cfg.llm.qa_generator.model), _ollama_tag(cfg.llm.qa_critic.model)
+    pulled, loaded, tags_asked = {generator, critic}, [], []
+
+    def get(url, timeout):
+        tags_asked.append(url)
+        models = [{"name": m, "digest": "d" * 64, "details": {"quantization_level": "Q8_0"}} for m in pulled]
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"models": models})
+
+    def post(url, json, timeout):
+        loaded.append(json["model"])
+        return SimpleNamespace(ok=True)
+
+    monkeypatch.setattr(llm_module.requests, "get", get)
+    monkeypatch.setattr(llm_module.requests, "post", post)
+    monkeypatch.setattr(llm_module, "_loaded_models", lambda native: {
+        loaded[-1]: {"size": 10, "size_vram": 10, "context_length": cfg.ollama.context_length}})
+    monkeypatch.setattr(llm_module, "_unload_and_wait", lambda native, model: None)
+    path = store.run_dir(cfg) / "ollama_models.jsonl"
+
+    check_ollama(cfg, SECRETS.ollama_base_url, ["qa_generator"])
+    assert loaded == [generator]
+    assert [(r["model"], r["roles"]) for r in store.read_jsonl(path)] == [(generator, ["qa_generator"])]
+
+    pulled.remove(generator)                        # the critic's stage doesn't need the generator
+    check_ollama(cfg, SECRETS.ollama_base_url, ["qa_critic"])
+    assert loaded == [generator, critic]
+    assert [(r["model"], r["roles"]) for r in store.read_jsonl(path)] == [(generator, ["qa_generator"]),
+                                                                          (critic, ["qa_critic"])]
+    asked = len(tags_asked)
+    check_ollama(cfg, SECRETS.ollama_base_url, ["judge"])          # on OpenAI
+    assert len(tags_asked) == asked and loaded == [generator, critic]
+
+
 # ======================================================================================
 # Live: Ollama
 # ======================================================================================
@@ -337,7 +376,7 @@ def live(tmp_path_factory):
 
 @pytest.mark.ollama
 def test_live_check_ollama(live):
-    check_ollama(live.cfg, live.secrets.ollama_base_url)
+    check_ollama(live.cfg, live.secrets.ollama_base_url, list(live.clients))      # every local role at once
     report = {r["model"]: r for r in store.read_jsonl(store.run_dir(live.cfg) / "ollama_models.jsonl")}
     for role, llm in live.clients.items():
         r = report[_ollama_tag(llm.model)]

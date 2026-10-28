@@ -5,7 +5,7 @@ with a different `base_url` means generator, critic, RAG generator and judge sha
 switching a role between Ollama and the OpenAI API is a config change (cfg.llm.<role>.provider).
 
 Typical use in a local stage:
-    check_ollama(cfg, secrets.ollama_base_url)             # preflight: fail in seconds
+    check_ollama(cfg, secrets.ollama_base_url, ["qa_generator"])   # preflight: fail in seconds
     llm = ChatLLM("qa_generator", cfg, secrets)
     llm.chat_many(batch, json_schema=..., on_result=save)  # save = append_jsonl per item
     unload_ollama_model(llm.base_url, llm.model)           # free the GPU for the next stage
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 import json
 import logging
@@ -25,7 +26,7 @@ import requests
 
 from chunkeval.core.config import Secrets
 from chunkeval.core.schema import Config
-from chunkeval.core.store import run_dir, write_jsonl
+from chunkeval.core.store import read_jsonl, run_dir, write_jsonl
 
 log = logging.getLogger(__name__)
 
@@ -110,21 +111,32 @@ def _unload_and_wait(native: str, model: str, timeout_s: float = 60) -> None:
         time.sleep(0.5)
 
 
-def check_ollama(cfg: Config, base_url: str) -> None:
+def check_ollama(cfg: Config, base_url: str, roles: list[str]) -> None:
     """Preflight check before a long local run — fail in seconds, not after 2 hours.
 
-    For every model used by an "ollama" role:
+    For every model one of `roles` uses on Ollama (the stage's roles, config.STAGE_LLM_ROLES; the
+    other stages' models are neither loaded nor needed):
       1. it is pulled (`GET /api/tags`);
       2. loaded with the server defaults, its context length is >= cfg.ollama.context_length
          (pitfall 1 in `chat`: a too-small window truncates prompts silently);
       3. its GPU share (size_vram / size) is reported. Below 100% is expected for gpt-oss:20b
          and logged as a warning, not an error: a MoE generator alternative also offloads by design.
-    Then writes model, quantization, size and digest of each model to
-    runs/<run_id>/ollama_models.jsonl — they are part of the experiment definition.
+    Then records model, quantization, size and digest of each model in
+    runs/<run_id>/ollama_models.jsonl — they are part of the experiment definition. Merged by model:
+    the file keeps every model the run's stages checked, each with its latest check.
 
     Each model is loaded and unloaded in turn, so it is measured alone, the way a stage runs it.
     All problems are collected and raised together in one RuntimeError.
     """
+    # Several roles can share one model (qa_generator and rag_generator): check each model once.
+    roles_by_model: dict[str, list[str]] = {}
+    for role in roles:
+        llm_cfg = getattr(cfg.llm, role)
+        if llm_cfg.provider == "ollama":
+            roles_by_model.setdefault(_ollama_tag(llm_cfg.model), []).append(role)
+    if not roles_by_model:
+        return
+
     # `base_url` is the OpenAI-compatible endpoint (.../v1); the checks need the native API.
     native = _native_url(base_url)
 
@@ -135,12 +147,6 @@ def check_ollama(cfg: Config, base_url: str) -> None:
     except requests.RequestException as e:
         raise RuntimeError(f"Ollama is not reachable at {native} (systemctl status ollama)") from e
     pulled = {m["name"]: m for m in r.json()["models"]}
-
-    # Several roles can share one model (qa_generator and rag_generator): check each model once.
-    roles_by_model: dict[str, list[str]] = {}
-    for role, llm_cfg in cfg.llm:          # iterating a pydantic model yields (field name, value)
-        if llm_cfg.provider == "ollama":
-            roles_by_model.setdefault(_ollama_tag(llm_cfg.model), []).append(role)
 
     missing = [m for m in roles_by_model if m not in pulled]
     if missing:
@@ -190,12 +196,15 @@ def check_ollama(cfg: Config, base_url: str) -> None:
             "size_bytes": loaded["size"],
             "gpu_share": round(gpu_share, 3),
             "context_length": ctx,
+            "checked": datetime.now().isoformat(timespec="seconds"),
         })
         _unload_and_wait(native, model)
 
     if problems:
         raise RuntimeError("Ollama preflight failed:\n  - " + "\n  - ".join(problems))
-    write_jsonl(run_dir(cfg) / "ollama_models.jsonl", report)
+    path = run_dir(cfg) / "ollama_models.jsonl"
+    records = {r["model"]: r for r in read_jsonl(path)} if path.exists() else {}
+    write_jsonl(path, {**records, **{r["model"]: r for r in report}}.values())
 
 
 class ChatLLM:

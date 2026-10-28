@@ -13,8 +13,8 @@ What every stage gets from here, so stage code doesn't repeat it:
      remove-corpus, which is no part of a run). Refused when a setting that can change a result
      differs from what the run recorded before, unless --accept-config (config.save_config);
   3. logging to the console and to runs/<run_id>/logs/<stage>_<timestamp>.log;
-  4. for stages with local LLM roles: `check_ollama` before, and the models unloaded after
-     (even when the stage fails), so the GPU is free for the next stage;
+  4. for stages with local LLM roles: `check_ollama` on the stage's own models before, and those
+     models unloaded after (even when the stage fails), so the GPU is free for the next stage;
   5. the stage's `run(cfg, secrets, **options)`, timed.
 
 Adding a stage option: register it in OPTIONS, list it in the stage's `options`, and add the
@@ -242,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if models:
             from chunkeval.core.llm import check_ollama
-            check_ollama(cfg, secrets.ollama_base_url)
+            check_ollama(cfg, secrets.ollama_base_url, config.STAGE_LLM_ROLES[args.command])
         for function in functions:
             function(cfg, secrets, **options)
     except KeyboardInterrupt:
