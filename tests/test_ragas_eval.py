@@ -394,6 +394,23 @@ def test_a_corpus_outside_corpus_comes_from_the_cache(evaluated, caplog):
     assert "nothing written" in caplog.text
 
 
+def test_a_local_judge_is_unloaded_before_the_cosines(evaluated, monkeypatch):
+    """The cosines load bge-m3, and `check_gpu_free` refuses while Ollama holds a model: a judge on
+    Ollama is unloaded first, as filter-qa unloads its critic. An OpenAI judge holds no local GPU."""
+    cfg, client = evaluated
+    events = []
+    monkeypatch.setattr(ragas_eval, "unload_ollama_model", lambda base_url, model: events.append(("unload", model)))
+    monkeypatch.setattr(ragas_eval, "check_gpu_free", lambda secrets: events.append(("gpu check",)))
+    evaluate(cfg)
+    assert events == [("gpu check",)]
+
+    events.clear()
+    cfg.llm.judge.provider, cfg.llm.judge.model = "ollama", "gpt-oss:20b"
+    monkeypatch.setattr(ragas_eval, "ollama_model_digest", lambda base_url, model: "sha256:judge")
+    assert evaluate(cfg) is not None
+    assert events == [("unload", "gpt-oss:20b"), ("gpu check",)]
+
+
 def test_stale_answers_are_refused(evaluated):
     cfg, client = evaluated
     pairs = load_pairs(filter_paths(cfg)["filtered"])

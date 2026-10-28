@@ -119,7 +119,7 @@ from ragas.prompt import PydanticPrompt
 from ragas.run_config import RunConfig
 
 from chunkeval.core.config import Secrets
-from chunkeval.core.llm import ollama_model_digest
+from chunkeval.core.llm import ollama_model_digest, unload_ollama_model
 from chunkeval.core.schema import Config
 from chunkeval.core.store import append_jsonl, read_jsonl, run_dir, write_json, write_jsonl, write_table
 from chunkeval.corpus.embedding import Embedder, check_gpu_free, load_specs
@@ -847,7 +847,10 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], pilot: int | None = N
         log.warning("no corpus has rows to score: nothing written")
         return
 
-    # 4. Scores, then the outputs.
+    # 4. Scores, then the outputs. The cosines need bge-m3 on the GPU, which `check_gpu_free` refuses while
+    # Ollama holds a model: a local judge is unloaded first, as filter-qa unloads its critic before dedup.
+    if cfg.llm.judge.provider == "ollama":
+        unload_ollama_model(secrets.ollama_base_url, cfg.llm.judge.model)
     scored = [(qa, a, j) for corpus, judged in judged_rows.items() for (qa, a), j in zip(items[corpus], judged)]
     rows = score_rows(cfg, secrets, scored)
     used = {r["key"]: r for _, _, j in scored for r in records_of(j)}
