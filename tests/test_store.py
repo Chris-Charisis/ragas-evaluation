@@ -100,6 +100,17 @@ def appended(tmp_path) -> Path:
     return p
 
 
+def test_filter_jsonl_keeps_the_rest_in_order(tmp_path):
+    """One corpus out of a shared file: the others stay in order; a file left empty is deleted."""
+    path = tmp_path / "x.jsonl"
+    store.write_jsonl(path, [{"id": i, "corpus": c} for i, c in enumerate(["a", "b", "a", "b"])])
+    before = path.read_bytes()
+    assert store.filter_jsonl(path, lambda r: True) == 0 and path.read_bytes() == before     # untouched
+    assert store.filter_jsonl(path, lambda r: r["corpus"] != "a") == 2 and ids(path) == [1, 3]
+    assert store.filter_jsonl(path, lambda r: False) == 2 and not path.exists()
+    assert store.filter_jsonl(path, lambda r: False) == 0                                    # missing file
+
+
 def test_done_ids_missing_file_is_empty(tmp_path):
     assert store.done_ids(tmp_path / "nope.jsonl") == set()
 

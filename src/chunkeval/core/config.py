@@ -16,22 +16,30 @@ Typical use, at the start of every stage (see cli.py):
     cfg = load_config(args.config)              # validated `Config` object
     secrets = load_secrets()                    # keys from .env, masked when printed
     require_secrets(args.command, cfg, secrets) # stop now if this stage lacks a key
-    save_config(cfg)                            # record what this run used
+    save_config(cfg)                            # record what this run used; refused if it changed
 
 Access settings with attributes, not dict keys: `cfg.embedding.primary`, `cfg.llm.judge.model`.
 
-Reads:  configs/*.yaml, .env
+Reads:  configs/*.yaml, .env, runs/<run_id>/config.yaml
 Used by: every stage (via cli.py).
 """
 from __future__ import annotations
 
+from datetime import datetime
+import json
+import logging
 from pathlib import Path
 import os
+import shutil
+from typing import Any, NamedTuple
 from dotenv import load_dotenv
 from pydantic import BaseModel, SecretStr, field_validator
+from pydantic_core import to_jsonable_python
 import yaml
 
 from chunkeval.core.schema import REPO_ROOT, Config
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------------------
@@ -100,6 +108,7 @@ def load_secrets(env_file: str | Path = ".env") -> Secrets:
 STAGE_SECRETS = {
     "index": ["weaviate_api_key"],
     "retrieve": ["weaviate_api_key"],
+    "remove-corpus": ["weaviate_api_key"],
 }
 # Requirements that depend on the config: the LLM roles (keys of the `llm:` section in the
 # YAML) each stage calls. The secret then follows from that role's `provider`, so switching
@@ -198,21 +207,155 @@ def load_config(path: str | Path) -> Config:
     return Config.model_validate(raw)
 
 
-def save_config(cfg: Config) -> Path:
+# --------------------------------------------------------------------------------------
+# The run's record of its config, and the guard on it
+# --------------------------------------------------------------------------------------
+
+# Settings that can't change a result, only how fast or how far a stage goes, what `eval`
+# estimates it costs, or where the run folders are: changing one under the same run_id changes
+# nothing the run measured.
+UNGUARDED = ("paths.runs_dir", "ollama.concurrency", "ragas.max_workers", "ragas.timeout", "ragas.max_retries",
+             "ragas.max_cost_usd", "ragas.prices")
+
+
+class ConfigChanged(RuntimeError):
+    """The config differs from the one this run_id recorded (`save_config` refuses)."""
+
+
+class ConfigDiff(NamedTuple):
+    """How a config differs from a run's record, one "key: old -> new" line per setting."""
+    changed: list[str]       # can change a result: refused unless accepted
+    unguarded: list[str]     # UNGUARDED settings
+    code: list[str]          # settings the code added or removed since the record was written
+
+
+def portable(value: Any) -> Any:
+    """The dumped config with every path under the repo written relative to it, so the record
+    doesn't depend on where the repo is (relative paths load the same: schema.py resolves them
+    against the repo root)."""
+    if isinstance(value, dict):
+        return {k: portable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [portable(v) for v in value]
+    if isinstance(value, str) and value.startswith(f"{REPO_ROOT}/"):
+        return value[len(f"{REPO_ROOT}/"):]
+    return value
+
+
+def flatten(tree: dict, prefix: tuple[str, ...] = ()) -> dict[tuple[str, ...], Any]:
+    """Nested mappings as {(section, ..., key): value}; a list is one value, an empty mapping none.
+    Tuples, not dotted strings: a key can hold dots ("gpt-4.1-mini" in ragas.prices)."""
+    flat: dict[tuple[str, ...], Any] = {}
+    for key, value in tree.items():
+        if isinstance(value, dict):
+            flat |= flatten(value, (*prefix, key))
+        else:
+            flat[(*prefix, key)] = value
+    return flat
+
+
+NO_DEFAULT = object()
+
+
+def section_field(cfg: Config, key: tuple[str, ...]) -> tuple[bool, Any]:
+    """Whether `key` is (or was) a field of a config section, one the code defines, rather than an
+    entry of a map the config fills in (a corpus in paths.corpora, a model in embedding.models);
+    and its default as the record would hold it, or NO_DEFAULT (required, or removed since)."""
+    node: Any = cfg
+    field = None
+    for part in key:
+        if isinstance(node, BaseModel):
+            field = type(node).model_fields.get(part)
+            if field is None:
+                return True, NO_DEFAULT        # a field this code doesn't have: removed since
+            node = getattr(node, part)
+        elif isinstance(node, dict) and part in node:
+            node, field = node[part], None
+        else:
+            return False, NO_DEFAULT           # an entry missing from a map
+    if field is None:
+        return False, NO_DEFAULT
+    if field.is_required():
+        return True, NO_DEFAULT
+    return True, portable(to_jsonable_python(field.get_default(call_default_factory=True)))
+
+
+def run_config_changes(cfg: Config, recorded: dict) -> ConfigDiff:
+    """How `cfg` differs from the config a run recorded (its runs/<run_id>/config.yaml).
+
+    A key only one side has is a setting the code added or removed since the record was written,
+    when it is a field of a section: not a change, because a new setting keeps the old behaviour,
+    unless it has a default and is set to something else. An entry of a map the config fills in (a
+    corpus added to paths.corpora) is a change like any other. Paths are compared relative to the
+    repo root (`portable`)."""
+    old, new = flatten(portable(recorded)), flatten(portable(cfg.model_dump(mode="json")))
+    diff = ConfigDiff([], [], [])
+    for key in sorted(old.keys() | new.keys()):
+        if key in old and key in new and old[key] == new[key]:
+            continue
+        dotted = ".".join(key)
+        line = f"{dotted}: {shown_value(old, key)} -> {shown_value(new, key)}"
+        if any(dotted == u or dotted.startswith(f"{u}.") for u in UNGUARDED):
+            diff.unguarded.append(line)
+            continue
+        is_field, default = section_field(cfg, key) if key not in old or key not in new else (False, NO_DEFAULT)
+        if is_field and (key not in new or default is NO_DEFAULT or new[key] == default):
+            diff.code.append(line)
+        else:
+            diff.changed.append(line)
+    return diff
+
+
+def shown_value(flat: dict, key: tuple[str, ...]) -> str:
+    return json.dumps(flat[key], ensure_ascii=False) if key in flat else "(not set)"
+
+
+def save_config(cfg: Config, accept: bool = False) -> Path:
     """Write the resolved config to runs/<run_id>/config.yaml — call at the start of every stage.
 
-    "Resolved" means after validation: absolute paths, defaults filled in. Together with the
-    code version and the seed, this file is what makes a run reproducible — it records what
-    the run actually used, even if configs/default.yaml is edited later.
-    Overwritten by each stage of the same run_id; bump run_id for a new experiment.
+    "Resolved" means after validation: defaults filled in, every path absolute, and written relative
+    to the repo root when under it (`portable`). Together with the code version and the seed, this
+    file is what makes a run reproducible — it records what the run actually used, even if
+    configs/default.yaml is edited later.
+
+    Guarded: when the run recorded a config before and a setting that can change a result differs
+    (`run_config_changes`), it raises ConfigChanged before anything is written, so the stages never
+    replace a run's results with ones made under other settings unnoticed. Bump run_id for a new
+    experiment, or `accept` (the CLI's --accept-config) to change this run: the old record is then
+    kept as runs/<run_id>/config_history/config_<when it was replaced>.yaml. Settings the code added
+    or removed, and UNGUARDED ones, are only logged.
     """
     out = cfg.paths.runs_dir / cfg.run_id / "config.yaml"
+    if out.exists():
+        diff = run_config_changes(cfg, yaml.safe_load(out.read_text(encoding="utf-8")) or {})
+        if diff.code:
+            log.info("settings the code added or removed since %s was written, not a change: %s",
+                     out.name, "; ".join(diff.code))
+        if diff.unguarded:
+            log.info("changed, but can't change a result: %s", "; ".join(diff.unguarded))
+        if diff.changed and not accept:
+            raise ConfigChanged(
+                f"the config differs from the one run {cfg.run_id} recorded ({shown_path(out)}):\n"
+                + "".join(f"    {line}\n" for line in diff.changed)
+                + "The stages would replace this run's results with ones made under these settings. Bump run_id "
+                  "for a new experiment, or re-run with --accept-config to change this run (its old config.yaml "
+                  "is then kept in config_history/)")
+        if diff.changed:
+            history = out.parent / "config_history" / f"config_{datetime.now():%Y%m%d-%H%M%S}.yaml"
+            history.parent.mkdir(exist_ok=True)
+            shutil.copy2(out, history)
+            log.warning("run %s now records a changed config (--accept-config): %s; the old one is %s",
+                        cfg.run_id, "; ".join(diff.changed), shown_path(history))
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         # mode="json" turns Path objects back into strings so yaml.safe_dump can write them;
         # sort_keys=False keeps the section order of the original YAML.
-        yaml.safe_dump(cfg.model_dump(mode="json"), f, sort_keys=False, allow_unicode=True)
+        yaml.safe_dump(portable(cfg.model_dump(mode="json")), f, sort_keys=False, allow_unicode=True)
     return out
+
+
+def shown_path(path: Path) -> str:
+    return str(path.relative_to(REPO_ROOT)) if path.is_relative_to(REPO_ROOT) else str(path)
 
 
 def collection_name(cfg: Config, corpus: str, method: str, overlap: bool) -> str:
@@ -234,7 +377,12 @@ def collection_name(cfg: Config, corpus: str, method: str, overlap: bool) -> str
         raise ValueError(f"unknown corpus '{corpus}'; configured: {list(cfg.paths.corpora)}")
     if method not in cfg.chunking.methods:
         raise ValueError(f"unknown method '{method}'; configured: {cfg.chunking.methods}")
+    return format_collection_name(cfg, corpus, method, overlap)
 
+
+def format_collection_name(cfg: Config, corpus: str, method: str, overlap: bool) -> str:
+    """`collection_name` without its checks that the corpus and method are configured: for the
+    collections of a corpus already taken out of the config (`remove-corpus`)."""
     # The template is a plain string from the YAML, e.g. "{corpus}_{method}_{overlap}_v2";
     # str.format fills each {placeholder} with the keyword argument of the same name.
     # The placeholders themselves are checked when the config loads (Weaviate model).

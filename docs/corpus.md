@@ -39,6 +39,13 @@ uv run chunkeval parse                              # every corpus; only new or 
 The title comes from Docling, or from [configs/titles.csv](../configs/titles.csv)
 (`parsing.title_overrides`) where Docling's is wrong.
 
+**Doc ids are unique across corpora.** Before parsing anything, the stage refuses a PDF whose name
+(without `.pdf`) another corpus already has, and names both files (`doc_id_clashes`). It checks the
+PDFs of every configured corpus, the parsed documents of every corpus in `data/parsed/` (also one left
+out of the config), and the documents with Q-A records (`raw.provenance.json`). Question ids are
+`<doc_id>:<unit_id>`, without the corpus, so a shared id would make `gen-qa` skip the new document's
+units as done and the report merge two corpora's questions.
+
 **What it writes:** `data/parsed/<corpus>/<doc_id>.json` (doc_id = the file name without `.pdf`) and
 `data/parsed/<corpus>/_failures.jsonl` (the PDFs that failed in the last run, with the error; one
 failure doesn't stop the corpus).

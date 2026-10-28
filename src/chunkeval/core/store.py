@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import dataclasses
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 import json
 import tempfile
 import os
@@ -166,6 +166,23 @@ def append_jsonl(path: str | Path, record: Any) -> None:
     _fix_unterminated_last_line(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(_to_line(record))
+
+
+def filter_jsonl(path: str | Path, keep: Callable[[dict[str, Any]], bool]) -> int:
+    """Rewrite a JSONL file with only the records `keep` accepts (atomically, as `write_jsonl`), or
+    delete it when none is left; return the number removed. A missing file removes nothing.
+    Used to take one corpus's records out of a file every corpus shares."""
+    path = REPO_ROOT / path
+    if not path.exists():
+        return 0
+    records = list(_iter_records(path))
+    kept = [r for r in records if keep(r)]
+    if len(kept) < len(records):
+        if kept:
+            write_jsonl(path, kept)
+        else:
+            path.unlink()
+    return len(records) - len(kept)
 
 
 def done_ids(path: str | Path, key: str = "id") -> set[str]:

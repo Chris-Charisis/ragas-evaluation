@@ -59,7 +59,7 @@ def test_stage_targets_accept_the_cli_options(command, cfg):
     """
     stage = cli.STAGES[command]
     options = {"corpora": ["papers"], "limit": 1, "embedders": ["bge_m3"], "recreate": True, "pilot": 2,
-               "dry_run": True}
+               "dry_run": True, "corpus": "reports", "yes": True}
     for target in stage.targets:
         function = cli.resolve(target)
         inspect.signature(function).bind(cfg, Secrets(), **{o: options[o] for o in stage.options})
@@ -212,6 +212,37 @@ def test_main_unloads_even_when_stage_fails(config_file, monkeypatch, ollama):
     with pytest.raises(SystemExit):
         cli.main(["gen-qa", "--config", str(config_file)])
     assert any(event == "unload" for event, _ in ollama)
+
+
+def test_main_refuses_a_changed_config_before_any_work(config_file, calls, tmp_path):
+    """Exit code 1, the stage not called, the refusal in the log; --accept-config goes ahead."""
+    cli.main(["chunk", "--config", str(config_file)])
+    raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    raw["retrieval"]["k_max"] = 10
+    config_file.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["retrieve", "--config", str(config_file)])
+    assert e.value.code == 1 and len(calls) == 1
+    run = tmp_path / "runs" / raw["run_id"]
+    log = next((run / "logs").glob("retrieve_*.log")).read_text(encoding="utf-8")
+    assert "retrieval.k_max: 20 -> 10" in log and "stage retrieve" not in log
+
+    cli.main(["retrieve", "--config", str(config_file), "--accept-config"])
+    assert len(calls) == 3 and len(list((run / "config_history").glob("config_*.yaml"))) == 1
+    with pytest.raises(SystemExit):                                      # no run record to guard
+        cli.build_parser().parse_args(["remove-corpus", "reports", "--accept-config"])
+
+
+def test_remove_corpus_needs_its_name_and_leaves_the_run_record_alone(config_file, calls, monkeypatch, tmp_path):
+    """remove-corpus takes the corpus as an argument (no default: it never means "every corpus"),
+    previews unless --yes, and doesn't overwrite a run's config.yaml."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["remove-corpus"])
+    monkeypatch.setattr(cli.config, "load_secrets", lambda: Secrets(weaviate_api_key="w"))
+    cli.main(["remove-corpus", "reports", "--config", str(config_file)])
+    assert calls[0]["options"] == {"corpus": "reports", "yes": False}
+    run = tmp_path / "runs" / calls[0]["cfg"].run_id
+    assert not (run / "config.yaml").exists() and list((run / "logs").glob("remove-corpus_*.log"))
 
 
 def test_main_non_llm_stage_never_touches_ollama(config_file, calls, ollama):

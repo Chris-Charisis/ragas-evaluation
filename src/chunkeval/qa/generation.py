@@ -44,7 +44,7 @@ from chunkeval.core.config import Secrets
 from chunkeval.core.llm import ChatLLM, LLMOutputError, LLMResult, ollama_model_digest
 from chunkeval.core.prompts import load_sections
 from chunkeval.core.schema import REPO_ROOT, Config, QuestionType
-from chunkeval.core.store import append_jsonl, done_ids, read_jsonl, run_dir, write_json, write_jsonl
+from chunkeval.core.store import append_jsonl, done_ids, filter_jsonl, read_jsonl, run_dir, write_json
 from chunkeval.corpus.chunking.base import load_counter, pack
 from chunkeval.corpus.chunking.sentence import block_sentences
 from chunkeval.corpus.parsing import is_skippable_section, load_doc
@@ -635,21 +635,14 @@ def write_provenance(path: Path, settings: dict[str, dict[str, Any]], hashes: di
 
 
 def delete_records(paths: dict[str, Path], corpora: list[str]) -> None:
-    """`--recreate`: every record of `corpora` out of raw.jsonl and gen_dropped.jsonl, then their
-    settings and doc hashes out of the provenance; a file left empty is deleted. The other corpora's
-    lines stay as they are."""
+    """`--recreate` and `remove-corpus`: every record of `corpora` out of raw.jsonl and
+    gen_dropped.jsonl, then their settings and doc hashes out of the provenance; a file left empty is
+    deleted. The other corpora's lines stay as they are."""
     settings, hashes = read_provenance(paths["provenance"])
     for name in ("raw", "dropped"):
-        path = paths[name]
-        if not path.exists():
-            continue
-        records = list(read_jsonl(path))
-        kept = [r for r in records if r["corpus"] not in corpora]
-        if kept:
-            write_jsonl(path, kept)
-        else:
-            path.unlink()
-        log.info("deleted %d record(s) of %s from %s (--recreate)", len(records) - len(kept), ", ".join(corpora), path)
+        removed = filter_jsonl(paths[name], lambda r: r["corpus"] not in corpora)
+        if removed:
+            log.info("deleted %d record(s) of %s from %s", removed, ", ".join(corpora), paths[name])
     # Written last: after a crash the provenance still names the deleted corpora, which is harmless.
     settings = {c: s for c, s in settings.items() if c not in corpora}
     hashes = {key: sha for key, sha in hashes.items() if key.split("/")[0] not in corpora}

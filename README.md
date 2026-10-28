@@ -48,7 +48,9 @@ be re-run without repeating the earlier ones; it redoes only what is missing or 
 | 8 | `eval` | Ragas metrics with an OpenAI judge, cost-capped (**the only paid stage**) → `runs/<id>/ragas/` | [evaluation](docs/evaluation.md#ragas-evaluation-eval) |
 | 9 | `report` | the report: tables, figures and paired comparisons with bootstrap CIs → `runs/<id>/reports/latest/` | [report](docs/report.md) |
 
-`<id>` is `run_id` in the config: bump it for every new experiment.
+`<id>` is `run_id` in the config: bump it for every new experiment. A stage refuses to run under a `run_id` whose recorded config differs in a setting that can change a result, unless you pass `--accept-config` ([the guard](docs/development.md#the-guard-on-a-runs-config)).
+
+To take a corpus out for good, `chunkeval remove-corpus NAME` lists everything the stages made from it, and `--yes` removes it ([removing a corpus](docs/development.md#removing-a-corpus-for-good)). To leave a corpus out of one run instead, leave it out of that run's config.
 
 ## Running a stage
 
@@ -67,9 +69,10 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 - **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `audit`, `embed`, `filter-qa`, `retrieve`, `answer` and `eval` have `--corpus` only.
 - **`--pilot N`** and **`--dry-run`** on `eval`: only the first N questions of each corpus's Ragas sample; or only the cost estimate, with no API call (see [Ragas evaluation](docs/evaluation.md#ragas-evaluation-eval)).
 - **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`) and on `retrieve` (default: `retrieval.embedders`).
+- **`--accept-config`** on every stage except `remove-corpus`: go ahead although the config differs from the one this `run_id` recorded. The old record is kept in `runs/<id>/config_history/`.
 - **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [Index](docs/corpus.md#index-index)). On `gen-qa`: delete the Q-A records of the selected corpora, and generate them again; the other corpora's records stay (see [Q-A generation](docs/qa.md#q-a-generation-gen-qa)).
 
-Every stage logs to the console and to `runs/<id>/logs/`, saves the config it used to `runs/<id>/config.yaml`, and stops in the first second on a config error or a missing secret ([what the CLI does around a stage](docs/development.md#the-cli)).
+Every stage logs to the console and to `runs/<id>/logs/`, saves the config it used to `runs/<id>/config.yaml`, and stops in the first second on a config error, a missing secret or a changed config ([what the CLI does around a stage](docs/development.md#the-cli)).
 
 ## Key decisions
 

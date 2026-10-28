@@ -3,11 +3,14 @@
 All offline and fast. A config error caught here is one that would otherwise surface hours
 into a run (or never, as a silently wrong setting).
 """
+import re
+from pathlib import Path
+
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from chunkeval.core.config import (Secrets, collection_name, load_config, load_secrets,
+from chunkeval.core.config import (ConfigChanged, Secrets, collection_name, load_config, load_secrets,
                               require_secrets, save_config)
 from chunkeval.core.schema import REPO_ROOT, Config, workspace_namespace
 
@@ -168,6 +171,91 @@ def test_save_config_round_trip(cfg):
     # The saved (resolved) config must itself be a valid config describing the same run.
     assert Config.model_validate(saved).model_dump() == cfg.model_dump()
     assert list(saved)[:3] == ["run_id", "seed", "paths"]      # section order kept
+    assert saved["paths"]["data_dir"] == "data"                # under the repo: relative, wherever it is
+    assert saved["paths"]["runs_dir"] == str(cfg.paths.runs_dir)   # outside it: absolute
+
+
+# --------------------------------------------------------------------------------------
+# save_config's guard: a run's record changes only when accepted
+# --------------------------------------------------------------------------------------
+
+def record(cfg) -> Path:
+    return cfg.paths.runs_dir / cfg.run_id / "config.yaml"
+
+
+def history(cfg) -> list[Path]:
+    return sorted((cfg.paths.runs_dir / cfg.run_id / "config_history").glob("*.yaml"))
+
+
+def test_a_changed_setting_is_refused_until_accepted(cfg):
+    save_config(cfg)
+    save_config(cfg)                                           # the same config: saved again
+    before = record(cfg).read_bytes()
+    cfg.retrieval.k_max, cfg.qa.two_span_ratio = 10, 0.5
+    with pytest.raises(ConfigChanged, match=r"(?s)qa.two_span_ratio: 0.2 -> 0.5\n.*retrieval.k_max: 20 -> 10\n"
+                                            r".*Bump run_id .* --accept-config"):
+        save_config(cfg)
+    assert record(cfg).read_bytes() == before and history(cfg) == []     # nothing written
+
+    save_config(cfg, accept=True)
+    assert [p.read_bytes() for p in history(cfg)] == [before]            # the old record, kept
+    assert yaml.safe_load(record(cfg).read_text(encoding="utf-8"))["retrieval"]["k_max"] == 10
+    save_config(cfg)                                           # the new record is the reference now
+
+
+def test_settings_that_cant_change_a_result_are_not_guarded(cfg, caplog):
+    save_config(cfg)
+    cfg.ragas.max_workers, cfg.ragas.max_cost_usd, cfg.ollama.concurrency = 8, 500, 4
+    with caplog.at_level("INFO"):
+        save_config(cfg)
+    assert "can't change a result: ollama.concurrency: 2 -> 4; ragas.max_cost_usd" in caplog.text
+    assert history(cfg) == [] and yaml.safe_load(record(cfg).read_text(encoding="utf-8"))["ragas"]["max_workers"] == 8
+
+
+def edit_record(cfg, edit) -> None:
+    saved = yaml.safe_load(record(cfg).read_text(encoding="utf-8"))
+    edit(saved)
+    record(cfg).write_text(yaml.safe_dump(saved, sort_keys=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("edit, logged", [
+    (lambda r: r.pop("prompts"), 'prompts.qa_critic: (not set) -> "prompts/qa_critic.md"'),   # required, added since
+    (lambda r: r["weaviate"].pop("namespace"), "weaviate.namespace: (not set) -> null"),       # added at its default
+    (lambda r: r["embedding"]["models"]["bge_m3"].pop("revision"),                             # in a map entry's section
+     "embedding.models.bge_m3.revision: (not set) -> "),
+    (lambda r: r["chunking"].update(old_knob=3), "chunking.old_knob: 3 -> (not set)"),           # removed since
+])
+def test_a_setting_the_code_added_or_removed_is_only_logged(cfg, caplog, edit, logged):
+    """A key only one side has, in a section: a setting the code added or removed since the record
+    was written. A new setting keeps the old behaviour, so it is no change."""
+    save_config(cfg)
+    edit_record(cfg, edit)
+    with caplog.at_level("INFO"):
+        save_config(cfg)
+    assert f"settings the code added or removed since config.yaml was written, not a change: {logged}" in caplog.text
+    assert history(cfg) == []
+
+
+@pytest.mark.parametrize("edit, refused", [
+    (lambda r: r["parsing"].pop("title_overrides"),                    # added since, but not at its default
+     'parsing.title_overrides: (not set) -> "configs/titles.csv"'),
+    (lambda r: r["paths"]["corpora"].pop("reports"),                   # a corpus added: an entry of a map
+     'paths.corpora.reports: (not set) -> "data/corpora/reports"'),
+])
+def test_a_new_key_that_changes_what_is_computed_is_refused(cfg, edit, refused):
+    save_config(cfg)
+    edit_record(cfg, edit)
+    with pytest.raises(ConfigChanged, match=re.escape(refused)):
+        save_config(cfg)
+
+
+def test_an_older_absolute_record_is_the_same_config(cfg, caplog):
+    """Records written before paths were saved relative hold them absolute: the same paths."""
+    save_config(cfg)
+    edit_record(cfg, lambda r: r["paths"].update(data_dir=str(REPO_ROOT / "data")))
+    with caplog.at_level("INFO"):
+        save_config(cfg)
+    assert "not a change" not in caplog.text and history(cfg) == []
 
 
 # --------------------------------------------------------------------------------------

@@ -13,7 +13,10 @@ Why:
     the abstract (a summary of the body, so a chunk of it that answers a question would score as
     a miss against evidence located in the body) are neither indexed nor asked about.
 
-Reads:  PDFs from cfg.paths.corpora[<corpus>]
+Doc ids: a document's id is its file name without `.pdf`, and it must be unique across the corpora
+of a data dir (question ids hold no corpus): `run` refuses a clash before parsing (`doc_id_clashes`).
+
+Reads:  PDFs from cfg.paths.corpora[<corpus>], data/parsed/*/ and data/qa/raw.provenance.json (doc ids)
 Writes: data/parsed/<corpus>/<doc_id>.json
 Next:   chunking/* and qa/generation.py
 """
@@ -862,8 +865,52 @@ def _is_up_to_date(path: Path, corpus: str, cfg: Config, pdf: Path) -> bool:
             and meta.get("ocr") == ocr)
 
 
+def doc_id_clashes(cfg: Config, corpora: list[str]) -> list[str]:
+    """The doc ids of `corpora`'s PDFs that another corpus of this data dir already has, each as
+    "<this file> and <the other one>". Another corpus has an id when it is the name of one of its
+    PDFs (configured corpora), of one of its parsed documents (every corpus in data/parsed/, also one
+    left out of the config) or of a document with Q-A records (raw.provenance.json).
+
+    Why: question ids are "<doc_id>:<unit_id>", without the corpus, so a shared id makes `gen-qa`
+    skip the new document's units as done and the report merge two corpora's questions."""
+    from chunkeval.qa.generation import qa_paths, read_provenance     # here: generation imports this module
+
+    def pdfs(corpus: str) -> list[Path]:
+        folder = cfg.paths.corpora[corpus]
+        return sorted(p for p in folder.iterdir() if p.suffix.lower() == ".pdf") if folder.is_dir() else []
+
+    owners: dict[str, list[tuple[str, str]]] = {}          # doc id -> (corpus, where it is), all corpora
+    for corpus in cfg.paths.corpora:
+        for pdf in pdfs(corpus):
+            owners.setdefault(pdf.stem, []).append((corpus, str(pdf)))
+    parsed = cfg.paths.data_dir / "parsed"
+    for folder in sorted(parsed.iterdir()) if parsed.is_dir() else []:
+        for doc in sorted(folder.glob("*.json")):
+            if not doc.name.startswith("_"):
+                owners.setdefault(doc.stem, []).append((folder.name, str(doc)))
+    provenance = qa_paths(cfg)["provenance"]
+    for key in read_provenance(provenance)[1]:
+        corpus, doc_id = key.split("/", 1)
+        owners.setdefault(doc_id, []).append((corpus, f"{provenance} ({key})"))
+
+    clashes = []
+    for corpus in corpora:
+        for pdf in pdfs(corpus):
+            other = next((where for c, where in owners[pdf.stem] if c != corpus), None)
+            if other is not None:
+                clashes.append(f"{pdf} and {other}")
+    return clashes
+
+
 def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = None) -> None:
-    """CLI entry (`chunkeval parse`): parse each corpus in `corpora`; `limit` PDFs per corpus."""
+    """CLI entry (`chunkeval parse`): parse each corpus in `corpora`; `limit` PDFs per corpus.
+    Refused before any PDF is parsed when one would share its doc id with another corpus
+    (`doc_id_clashes`)."""
+    clashes = doc_id_clashes(cfg, corpora)
+    if clashes:
+        raise RuntimeError(f"{len(clashes)} doc id(s) already used by another corpus: {'; '.join(clashes[:5])}"
+                           f"{'; ...' if len(clashes) > 5 else ''}. Question ids are <doc_id>:<unit_id>, without "
+                           f"the corpus, so give the new corpus's files their own prefix (docs/rerun.md, 6B)")
     for corpus in corpora:
         paths = parse_corpus(corpus, cfg, limit=limit)
         log.info("%s: %d documents parsed into %s", corpus, len(paths), cfg.paths.data_dir / "parsed" / corpus)

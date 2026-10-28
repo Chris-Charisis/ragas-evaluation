@@ -35,14 +35,6 @@ Not a stage (decided 2026-10-11). Run once by hand on 2026-10-21, in the trial t
 
 Not implemented (2026-10-12). When a corpus has more questions than `ragas.sample_per_corpus`, `eval` scores a seeded random subset (`ragas_sample`), so by chance it can over- or under-represent a document, a question type or the two-span pairs. A stratified draw would keep the question set's mix, e.g. proportionally per document and question type, while staying nested (a pilot is still the start of the full sample). It matters now: the full corpus has more questions than `ragas.sample_per_corpus` (500) in both corpora. The alternative is to score every question: about $0.04 each, ~$40 per 1,000 questions.
 
-## Document ids unique across corpora
-
-Not implemented (2026-10-28). A document's id is its file name without `.pdf`, and nothing checks that it occurs in one corpus only. Question ids are `<doc_id>:<unit_id>`, with no corpus in them, so a new corpus with a file named like an existing one (`paper_12.pdf`) would collide:
-- `gen-qa` treats a unit as done when its id is in `raw.jsonl`, so the new corpus's units with an already used id would be skipped silently;
-- the report indexes the questions by id alone (`analysis/inputs.py`), so two corpora's questions would merge.
-
-The fix is a check in `parse` (or the config) that refuses a doc id another configured corpus already has, naming both files. Changing the question ids to include the corpus instead would change every hash: the Ragas sample is drawn by `sha256(seed|id)`, so the sample would be new and the judge paid again. Until then, give a new corpus's files their own prefix (`thesis_<i>.pdf`, see [rerun.md](rerun.md#6b-a-new-corpus)).
-
 ## Models on our own servers
 
 Not implemented (2026-10-12; to revisit once the server details are known). Any role (generator, critic, judge) could use a model served behind the OpenAI API on one of our servers (vLLM, TGI, …). Today only two providers exist: `openai` always goes to api.openai.com, and `ollama` also calls Ollama-only endpoints for its checks and model digest. It needs:

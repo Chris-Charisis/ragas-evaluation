@@ -9,7 +9,7 @@ src/chunkeval/
 ├── cli.py              entry point, one subcommand per stage (`uv run chunkeval …`)
 ├── core/               shared by every stage, no pipeline logic
 │   ├── schema.py       pydantic models of configs/*.yaml (`Config`) and REPO_ROOT
-│   ├── config.py       load_config (with `extends`) / save_config, secrets from .env, collection_name
+│   ├── config.py       load_config (with `extends`) / save_config (guarded), secrets from .env, collection_name
 │   ├── store.py        JSONL / Parquet persistence, resumable appends, run folders
 │   ├── llm.py          one chat client for every LLM role (Ollama or OpenAI)
 │   └── prompts.py      prompts/*.md split into checked `## <name>` sections
@@ -18,7 +18,8 @@ src/chunkeval/
 │   ├── audit.py        the corpus checks between parse and chunk
 │   ├── chunking/       base.py, character.py, sentence.py, recursive.py
 │   ├── embedding.py
-│   └── indexing.py
+│   ├── indexing.py
+│   └── removal.py      `remove-corpus`: everything of one corpus out of data/ and Weaviate
 ├── qa/                 stages 4–5: the ground-truth questions
 │   ├── generation.py
 │   └── filtering.py
@@ -45,7 +46,7 @@ src/chunkeval/
 
 **What the CLI does around every stage,** so stage code doesn't have to:
 1. It validates the config and checks this stage's secrets, so a problem stops the run in the first second.
-2. It saves the resolved config to `runs/<run_id>/config.yaml`, the record of what the run used.
+2. It saves the resolved config to `runs/<run_id>/config.yaml`, the record of what the run used. Paths under the repo are written relative to it, so the record still holds after the repo moves. When the run recorded one before, [the guard](#the-guard-on-a-runs-config) compares the two first.
 3. It logs to the console and to `runs/<run_id>/logs/<stage>_<timestamp>.log`.
 4. **For stages with local LLM roles** (`gen-qa`, `filter-qa`, `answer`): it runs `check_ollama` first, then unloads the models afterwards, even if the stage fails.
 5. It calls the stage's `run(cfg, secrets, **options)` and logs how long it took. A failure is logged with its traceback and exits with code 1; Ctrl+C exits with 130.
@@ -56,6 +57,20 @@ src/chunkeval/
 3. Add a keyword argument with the same name to that stage's `run`.
 
 `tests/test_cli.py` fails if these three steps don't match.
+
+### The guard on a run's config
+
+A stage under a `run_id` that already recorded a config compares the two before any work (`config.save_config`). When a setting that can change a result differs, the stage **refuses**: it exits with code 1, names each changed key (`qa.critic_min_score: 4 -> 3`), and writes the refusal to the log. Otherwise the stages would replace the run's results with ones made under the new settings, without asking: `filter-qa` rewrites the question set, `retrieve` redoes stale files, `answer` and `eval` rewrite their tables. Two ways on:
+- **A new experiment:** bump `run_id`. The old run stays as it was.
+- **A change to this run:** re-run with `--accept-config`. The old record moves to `runs/<run_id>/config_history/config_<when it was replaced>.yaml`, so the run folder keeps every config its results were made under.
+
+What doesn't count as a change, and is only logged:
+- **Settings that can't change a result** (`config.UNGUARDED`): `paths.runs_dir`, `ollama.concurrency`, `ragas.max_workers`, `timeout`, `max_retries`, `max_cost_usd` and `prices`. A setting not on this list is guarded, so a new one is safe by default.
+- **A setting the code added or removed** since the record was written: a key one side doesn't have, in a section. A new setting keeps the old behaviour. The exception is a setting added with a default and set to something else (`title_overrides`), which is a change.
+
+A key added to a map the config fills in is a change like any other: a corpus in `paths.corpora`, a model in `embedding.models`. `--corpus` and `--limit` aren't part of the config, so a smoke test never trips the guard. Neither does `remove-corpus`: it isn't part of a run, so it neither saves nor checks a record.
+
+`full_data-v1.0` was recorded before `extends` and the data-dir namespaces. Its first stage under this code refuses on two keys whose form changed but whose effect didn't: `embedding.cache_dir` (now derived) and `weaviate.collection_template` (now `{namespace}…`, empty for `data/`). One `--accept-config` clears both.
 
 ## Configs for other experiments
 
@@ -109,11 +124,35 @@ parsing: {body: {papers: null, reports: null}, title_overrides: null}
 Run every stage with `--config` on it. It gets its own question set (its own generator, critic and thresholds if wanted), its own labelling sample and its own report. It shares the Weaviate server (under its own collection names), Ollama, the GPU and the LLM caches.
 
 **3. A new corpus with some or all of the existing ones.** Keep `data/`, so the corpora share one question set, made the same way:
-1. Add the corpus to `paths.corpora` (a `parsing.body` rule is optional). Its document ids must not occur in another corpus: question ids are `<doc_id>:<unit_id>`.
+1. Add the corpus to `paths.corpora` (a `parsing.body` rule is optional). Give its files their own prefix: question ids are `<doc_id>:<unit_id>`, so `parse` refuses a document id another corpus already has.
 2. Run `parse` through `gen-qa` with `--corpus <new>`, then `filter-qa --corpus <new>`. The other corpora's lines in `filtered.jsonl` and `rejected.jsonl` are carried over unchanged.
 3. Use a new `run_id`, then run `retrieve`, `answer`, `eval` and `report`. The shared caches serve papers and reports, so the judge pays only for the new corpus (check with `eval --dry-run`).
 
-For only some of the existing corpora, an overlay leaves the others out (`paths.corpora: {reports: null}` and `parsing.body: {reports: null}`). `gen-qa` and `filter-qa` record their settings per corpus, and the report warns when the corpora of a run were made with different ones.
+For only some of the existing corpora, an overlay leaves the others out (`paths.corpora: {reports: null}` and `parsing.body: {reports: null}`), with its own `run_id`: under the old one, `retrieve` and `eval` would rewrite that run's tables without them. `gen-qa` and `filter-qa` record their settings per corpus, and the report warns when the corpora of a run were made with different ones.
+
+A corpus left out of a config is still in `data/`: `filter-qa` carries its lines over, its collections stay, and `parse` keeps its doc ids reserved. Adding it back costs nothing.
+
+### Removing a corpus for good
+
+```bash
+uv run chunkeval remove-corpus reports         # lists what it would remove; removes nothing
+uv run chunkeval remove-corpus reports --yes   # removes it
+```
+
+**What goes** (`corpus/removal.py`), from the config's data dir and Weaviate:
+- `data/parsed/<corpus>/` and `data/chunks/<corpus>/`;
+- its vectors: `data/embeddings/<embedder>/<corpus>/`, `queries/<embedder>/<corpus>.*` and `dedup/<embedder>/<corpus>.*`;
+- its lines in `raw.jsonl`, `gen_dropped.jsonl`, `filtered.jsonl` and `rejected.jsonl`, and its entries in both provenance files of `data/qa/`. The other corpora's lines stay as they are;
+- its Weaviate collections, for every chunking method and overlap under the data dir's namespace, but only those whose provenance says `index` built them from its chunks.
+
+Its doc ids are then free again.
+
+**What stays, on purpose:**
+- **The inputs:** its PDFs, the configs and `configs/titles.csv`. The command edits no input, so everything it removes can be rebuilt from them. Delete `data/corpora/<corpus>/` and its rows in `rename_map.csv` and `titles.csv` yourself if you want them gone too.
+- **`runs/`:** the results of finished runs, the record of what was measured.
+- **The caches keyed by content** (`data/llm_cache/`, `data/qa/critic_scores.jsonl`): an entry only ever serves the identical call, so a leftover can't affect another corpus. If the corpus comes back, nothing is asked or paid for again.
+
+**Refused** while any config with the same data dir still lists the corpus (the one given, or any of `configs/*.yaml`): the next `parse` would bring it back, or another experiment still needs it. Take it out of `paths.corpora` and `parsing.body` of each first. A name with nothing to remove is refused too (a typo). Weaviate must be running, so the list is complete before anything is removed. The command doesn't overwrite the run's `config.yaml`, and it can be run again after a crash.
 
 ## Testing
 
@@ -136,13 +175,14 @@ uv run pytest -k crash                          # tests whose name contains "cra
 
 | File | Tests | Needs |
 |---|---|---|
-| [tests/test_config.py](../tests/test_config.py) | Config loading (from any working directory) and every validation rule: unknown keys, types, ranges, `TODO` placeholders, cross-section references, missing prompt files, a namespace that isn't a name, another data dir without `{namespace}`. `extends`: mappings merge, lists and values replace, `null` removes a key, the base is found next to the file, chains work, a cycle is refused. Another data dir gets its own vector cache and collection names but shares the LLM caches. Also the `save_config` round trip, secrets (masking, per-stage requirements), and collection names. | nothing |
-| [tests/test_store.py](../tests/test_store.py) | Atomic `write_jsonl`, crash-tolerant `append_jsonl` / `done_ids` (the resume mechanism), corruption detection, `write_table` (parquet, duplicate keys, CSV fallback) and `run_dir`. | nothing |
+| [tests/test_config.py](../tests/test_config.py) | Config loading (from any working directory) and every validation rule: unknown keys, types, ranges, `TODO` placeholders, cross-section references, missing prompt files, a namespace that isn't a name, another data dir without `{namespace}`. `extends`: mappings merge, lists and values replace, `null` removes a key, the base is found next to the file, chains work, a cycle is refused. Another data dir gets its own vector cache and collection names but shares the LLM caches. Also the `save_config` round trip (paths under the repo saved relative), its guard (a changed setting refused until accepted, the old record kept; the unguarded settings; a setting the code added or removed only logged, unless added at another value than its default; a corpus added refused; an older absolute record the same config), secrets (masking, per-stage requirements), and collection names. | nothing |
+| [tests/test_store.py](../tests/test_store.py) | Atomic `write_jsonl`, crash-tolerant `append_jsonl` / `done_ids` (the resume mechanism), corruption detection, `filter_jsonl` (one corpus out of a shared file), `write_table` (parquet, duplicate keys, CSV fallback) and `run_dir`. | nothing |
 | [tests/test_llm.py](../tests/test_llm.py), offline | `ChatLLM` setup per provider. `chat` and `chat_many` logic against a fake client: the parameters sent, every `LLMOutputError` case, result order, errors returned in place, concurrency limit, and Ctrl+C cancellation. | nothing |
 | [tests/test_llm.py](../tests/test_llm.py), marker `ollama` | Preflight (`check_ollama`), JSON answers from every local role, determinism, resume after an interrupted run, and unloading. Also pins the Ollama behaviour the code relies on: `reasoning_effort="none"` turns Qwen's thinking off, and too-long prompts are truncated silently (and caught by `chat`). Generators must be 100% on the GPU (for Gemma, the derived `gemma4-allgpu` tag). | Ollama running, models pulled, `OLLAMA_BASE_URL` |
-| [tests/test_cli.py](../tests/test_cli.py) | Every stage in `cli.STAGES` points to a `run` that accepts the options the CLI passes. Argument parsing, and what `main` does around a stage: config saved, log file written, exit codes 1 and 130, missing secrets stop the run before any work, and the Ollama check before and unload after an LLM stage, even when it fails. | nothing |
+| [tests/test_cli.py](../tests/test_cli.py) | Every stage in `cli.STAGES` points to a `run` that accepts the options the CLI passes. Argument parsing, and what `main` does around a stage: config saved, log file written, exit codes 1 and 130, missing secrets stop the run before any work, a changed config stops it too (logged) until `--accept-config`, and the Ollama check before and unload after an LLM stage, even when it fails. `remove-corpus` needs the corpus named (no default) and doesn't overwrite the run's `config.yaml`. | nothing |
+| [tests/test_removal.py](../tests/test_removal.py) | `remove-corpus` on two corpora's artefacts with a fake Weaviate: without `--yes` nothing changes; with it, the corpus's folders, vectors, lines, provenance entries and collections go, while the other corpus's files stay byte for byte, a collection with its name but built from other chunks stays, and its doc ids are free again. Refused while the config given, or a `configs/*.yaml` with the same data dir, lists it (not one with another data dir); a misspelt name finds nothing. | nothing |
 | [tests/test_llm.py](../tests/test_llm.py), marker `openai` | The API key is valid and the judge model still exists. It only calls a free metadata endpoint, so there's **no cost**. | `OPENAI_API_KEY` |
-| [tests/test_parsing.py](../tests/test_parsing.py) | Body selection on hand-built documents: papers from the Introduction (or Background, or Results first) to the end markers, a paper without anchors kept whole, an end marker before the start ignored; reports' dropped sections with their subsections, never more than `DROP_MAX_SHARE` of the document, title prefixes ("Annex 2: …"); lead labels (a parenthesis isn't one, the first quarter is front matter). `title_matches`, `ocr_helps`, and the CanonicalDoc invariants: offsets within the text, blocks sorted and disjoint, sections containing their children, page furniture dropped. | nothing |
+| [tests/test_parsing.py](../tests/test_parsing.py) | Body selection on hand-built documents: papers from the Introduction (or Background, or Results first) to the end markers, a paper without anchors kept whole, an end marker before the start ignored; reports' dropped sections with their subsections, never more than `DROP_MAX_SHARE` of the document, title prefixes ("Annex 2: …"); lead labels (a parenthesis isn't one, the first quarter is front matter). `title_matches`, `ocr_helps`, and the CanonicalDoc invariants: offsets within the text, blocks sorted and disjoint, sections containing their children, page furniture dropped. The doc-id check: distinct names pass, and a PDF named like another corpus's PDF, parsed document (also of a corpus left out of the config) or document with Q-A records is refused before anything is parsed. | nothing |
 | [tests/test_audit.py](../tests/test_audit.py) | Each audit check on hand-made text: the language of a block (French, Portuguese, English, an e-mail domain), the title flags (author list, line numbers, banner, short, long, shared, the doc id, and what must pass: "Deliverable 4.4.1.1", "TOLERANCE1", years), garbled and other-language shares, near-duplicates. The `audit` stage on a small parsed corpus: both files written and `data/` untouched; byte-identical PDFs, French and garbled documents warned; an overridden title not listed; missing parsed docs or word lists stop it with the fix. | nothing (a fake token counter and word list) |
 | [tests/test_chunking.py](../tests/test_chunking.py) | The chunk invariants on all 6 configurations: `text == doc.text[start:end]`, full coverage, `max_tokens`, disjoint spans without overlap, the overlap budget. Also sentence boundaries around tricky abbreviations, the section chunker's groups, the shared size rules (`pack`, `overlap_start`), each way `validate_chunks` fails, and the `chunk` stage's output files. When `data/parsed/` exists, the 6 configurations also run on the first 2 parsed documents of each corpus with the config sizes. | the bge-m3 tokenizer (~20 MB, downloaded on first use) |
 | [tests/test_embedding.py](../tests/test_embedding.py), offline | The vector cache and the `embed` stage with a fake embedder. Each model is loaded once and only when a file needs it. A re-run embeds only changed chunk files: the cache compares content hashes, not mtimes, and a changed query prompt doesn't count. A new model revision re-embeds that model's files. A crashed run resumes. The loader refuses vectors whose chunk_ids differ (order included) or whose settings are stale. The Ollama guard names the loaded models and passes when Ollama is unreachable. | nothing |

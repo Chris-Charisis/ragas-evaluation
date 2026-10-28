@@ -1,9 +1,13 @@
 """Invariants of CanonicalDoc (see parsing.CanonicalDoc docstring)."""
+import re
+
 import pytest
 
 from chunkeval.core.schema import BodyRule
-from chunkeval.corpus.parsing import (Piece, assemble_doc, ocr_helps, select_body, title_has_prefix,
-                                      title_matches)
+from chunkeval.core.store import write_json
+from chunkeval.corpus.parsing import (Piece, assemble_doc, doc_id_clashes, ocr_helps, run, select_body,
+                                      title_has_prefix, title_matches)
+from chunkeval.qa.generation import qa_paths
 
 
 def H(text, level=1):
@@ -130,6 +134,46 @@ def test_selected_body_assembles_into_a_valid_doc():
     kept, _ = select_body([P("Abstract"), H("Introduction"), P("Intro."), H("References"), P("x")], PAPERS)
     doc = assemble_doc("d", "papers", "t", kept)       # validate_doc runs inside
     assert doc.text == "Introduction\n\nIntro." and doc.sections[0].title == "Introduction"
+
+
+# --- doc ids, unique across corpora ---------------------------------------------------------------
+
+@pytest.fixture
+def corpora(cfg, tmp_path):
+    """cfg with data/ and both corpora's PDF folders in tmp_path: papers/paper_1.pdf, reports/report_1.pdf
+    (empty files: the check never opens them)."""
+    cfg.paths.data_dir = tmp_path / "data"
+    cfg.paths.corpora = {corpus: tmp_path / "pdfs" / corpus for corpus in cfg.paths.corpora}
+    for corpus, name in (("papers", "paper_1"), ("reports", "report_1")):
+        cfg.paths.corpora[corpus].mkdir(parents=True)
+        (cfg.paths.corpora[corpus] / f"{name}.pdf").write_bytes(b"")
+    return cfg
+
+
+def test_distinct_doc_ids_pass(corpora):
+    write_json(corpora.paths.data_dir / "parsed" / "papers" / "paper_1.json", {})     # the corpus's own document
+    assert doc_id_clashes(corpora, ["papers", "reports"]) == []
+
+
+@pytest.mark.parametrize("other, named", [
+    ("pdf", "pdfs/reports/x.pdf"), ("parsed", "data/parsed/theses/x.json"),
+    ("records", "data/qa/raw.provenance.json (theses/x)")])
+def test_doc_id_of_another_corpus_is_refused(corpora, other, named):
+    """A PDF named like another corpus's document is refused before anything is parsed: a PDF of a
+    configured corpus, a parsed document of a corpus left out of the config, or a document with
+    Q-A records."""
+    cfg = corpora
+    (cfg.paths.corpora["papers"] / "x.pdf").write_bytes(b"")
+    if other == "pdf":
+        (cfg.paths.corpora["reports"] / "x.pdf").write_bytes(b"")
+    elif other == "parsed":
+        write_json(cfg.paths.data_dir / "parsed" / "theses" / "x.json", {})
+    else:
+        write_json(qa_paths(cfg)["provenance"], {"settings_by_corpus": {}, "docs": {"theses/x": "sha"}})
+    with pytest.raises(RuntimeError, match=r"1 doc id\(s\) already used by another corpus: \S*/pdfs/papers/x\.pdf and "
+                                           rf"\S*/{re.escape(named)}\. Question ids"):
+        run(cfg, None, corpora=["papers"])
+    assert not (cfg.paths.data_dir / "parsed" / "papers").exists()
 
 
 def test_block_and_section_offsets_within_text():

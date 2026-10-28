@@ -54,7 +54,7 @@ from chunkeval.core.config import Secrets
 from chunkeval.core.llm import ChatLLM, LLMOutputError, LLMResult, ollama_model_digest, unload_ollama_model
 from chunkeval.core.prompts import load_sections
 from chunkeval.core.schema import REPO_ROOT, Config
-from chunkeval.core.store import append_jsonl, read_jsonl, run_dir, write_json, write_jsonl
+from chunkeval.core.store import append_jsonl, filter_jsonl, read_jsonl, run_dir, write_json, write_jsonl
 from chunkeval.corpus.embedding import Embedder, check_gpu_free, load_specs, save_npy
 from chunkeval.corpus.parsing import load_doc
 from chunkeval.qa.generation import QAPair, load_pairs, qa_paths, render_passages, text_sha256
@@ -524,6 +524,22 @@ def read_filter_provenance(cfg: Config) -> dict[str, dict[str, Any]]:
     (2026-10-28) is missing."""
     path = filter_paths(cfg)["provenance"]
     return json.loads(path.read_text(encoding="utf-8"))["settings_by_corpus"] if path.exists() else {}
+
+
+def delete_records(paths: dict[str, Path], corpora: list[str]) -> None:
+    """`remove-corpus`: every line of `corpora` out of filtered.jsonl and rejected.jsonl, and their
+    filter settings out of filtered.provenance.json; a file left empty is deleted."""
+    for name in ("filtered", "rejected"):
+        removed = filter_jsonl(paths[name], lambda r: r["corpus"] not in corpora)
+        if removed:
+            log.info("deleted %d record(s) of %s from %s", removed, ", ".join(corpora), paths[name])
+    if paths["provenance"].exists():
+        settings = json.loads(paths["provenance"].read_text(encoding="utf-8"))["settings_by_corpus"]
+        settings = {c: s for c, s in settings.items() if c not in corpora}
+        if settings:
+            write_json(paths["provenance"], {"settings_by_corpus": settings})
+        else:
+            paths["provenance"].unlink()
 
 
 def carry_over(paths: dict[str, Path], raw: list[QAPair], corpora: list[str]) -> tuple[list[QAPair], list[QAPair]]:

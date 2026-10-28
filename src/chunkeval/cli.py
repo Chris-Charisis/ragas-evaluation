@@ -9,7 +9,9 @@ Examples:
 
 What every stage gets from here, so stage code doesn't repeat it:
   1. config validated, secrets checked for this stage (fail in the first second);
-  2. the resolved config saved to runs/<run_id>/config.yaml (what this run actually used);
+  2. the resolved config saved to runs/<run_id>/config.yaml (what this run actually used; not for
+     remove-corpus, which is no part of a run). Refused when a setting that can change a result
+     differs from what the run recorded before, unless --accept-config (config.save_config);
   3. logging to the console and to runs/<run_id>/logs/<stage>_<timestamp>.log;
   4. for stages with local LLM roles: `check_ollama` before, and the models unloaded after
      (even when the stage fails), so the GPU is free for the next stage;
@@ -42,6 +44,9 @@ class Stage:
     help: str
     targets: tuple[str, ...]          # "module:function", called in this order
     options: tuple[str, ...] = ()     # keys of OPTIONS this stage accepts
+    # False for a command that is no part of a run (remove-corpus): it must not overwrite the
+    # config.yaml a finished run recorded.
+    saves_config: bool = True
 
 
 STAGES: dict[str, Stage] = {
@@ -69,6 +74,9 @@ STAGES: dict[str, Stage] = {
                   ("chunkeval.evaluation.ragas_eval:run",), ("corpora", "pilot", "dry_run")),
     "report": Stage("Stage 9: tables with bootstrap CIs, paired diffs, breakdowns",
                     ("chunkeval.analysis:run",)),
+    "remove-corpus": Stage("Remove a corpus for good: everything the stages made from it in the data dir and "
+                           "Weaviate (not its PDFs, the configs, runs/ or the shared caches). Lists it; removes "
+                           "with --yes", ("chunkeval.corpus.removal:run",), ("corpus", "yes"), saves_config=False),
 }
 
 
@@ -103,6 +111,10 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
     "dry_run": lambda p: p.add_argument(
         "--dry-run", action="store_true",
         help="estimate the judge's cost of everything not cached yet, then stop: no API call, nothing written"),
+    "corpus": lambda p: p.add_argument(
+        "corpus", metavar="CORPUS", help="the corpus to remove; it must be out of every config's paths.corpora"),
+    "yes": lambda p: p.add_argument(
+        "--yes", action="store_true", help="remove; without it, only list what would be removed"),
 }
 
 
@@ -119,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=stage.help, description=stage.help, parents=[common])
         for option in stage.options:
             OPTIONS[option](p)
+        if stage.saves_config:
+            p.add_argument("--accept-config", action="store_true",
+                           help="go ahead although the config differs from the one this run_id recorded "
+                                "(runs/<run_id>/config.yaml; the old one is kept in config_history/); default: "
+                                "refuse, so no stage replaces a run's results under other settings unnoticed. "
+                                "For a new experiment, bump run_id instead")
     return parser
 
 
@@ -177,6 +195,11 @@ def add_log_file(cfg: Config, command: str) -> logging.FileHandler:
     return handler
 
 
+def close_log_file(handler: logging.FileHandler) -> None:
+    logging.getLogger().removeHandler(handler)
+    handler.close()
+
+
 def _elapsed(start: float) -> str:
     seconds = time.monotonic() - start
     if seconds < 60:
@@ -198,9 +221,16 @@ def main(argv: list[str] | None = None) -> None:
     options = stage_options(stage, args, cfg)
     functions = [resolve(target) for target in stage.targets]
 
-    # 2.–3. Record what this run used, and keep a log file next to it.
+    # 2.–3. Keep a log file, and record what this run used: refused, before any work, when that
+    # would change what the run recorded before (the refusal is in the log too).
     file_handler = add_log_file(cfg, args.command)
-    saved = config.save_config(cfg)
+    try:
+        saved = (config.save_config(cfg, args.accept_config) if stage.saves_config
+                 else "(not saved: no part of a run)")
+    except config.ConfigChanged as e:
+        log.error("%s", e)
+        close_log_file(file_handler)
+        raise SystemExit(1) from None
     log.info("stage %s | run_id %s | options %s | config saved to %s",
              args.command, cfg.run_id, options, saved)
 
@@ -230,8 +260,7 @@ def main(argv: list[str] | None = None) -> None:
                     unload_ollama_model(secrets.ollama_base_url, model)
                 except Exception as e:         # never hide the stage's own error behind this one
                     log.warning("could not unload %s: %s", model, e)
-        logging.getLogger().removeHandler(file_handler)
-        file_handler.close()
+        close_log_file(file_handler)
 
 
 if __name__ == "__main__":

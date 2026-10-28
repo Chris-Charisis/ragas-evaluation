@@ -222,7 +222,7 @@ ls data/corpora/papers | wc -l; ls data/corpora/reports | wc -l      # 150 and 1
 
 ### 6B. A new corpus
 
-The document id is the file name without `.pdf`, and it must be unique across both corpora. Copy the
+The document id is the file name without `.pdf`, and it must be unique across the corpora (`parse` refuses a clash). Copy the
 new PDFs in as `paper_<i>.pdf` / `report_<i>.pdf`, numbered in natural sort order, and record the
 original names and checksums. Set `src` to the folder with the new PDFs and run once per corpus
 (`corpus=papers prefix=paper`, then `corpus=reports prefix=report`):
@@ -276,6 +276,10 @@ grep -n 'docs_per_corpus' configs/default.yaml
 ```
 
 Leave everything else as it is: it was decided on purpose (see the comments next to each setting in the config).
+
+Settle them before the first stage: from then on, a stage under this `run_id` refuses when a setting
+differs from the config the run recorded, until you bump `run_id` or pass `--accept-config`
+([the guard](development.md#the-guard-on-a-runs-config)).
 
 ## 8. Run the pipeline
 
