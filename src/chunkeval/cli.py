@@ -55,8 +55,10 @@ STAGES: dict[str, Stage] = {
     "audit": Stage("Stage 1b: audit the parsed corpus before chunking (OCR, body, titles, garbled text, "
                    "languages, duplicates, size); flags only, changes nothing",
                    ("chunkeval.corpus.audit:run",), ("corpora",)),
+    # No --limit: its chunk files are the ones a full run writes, so a limited run would replace them.
+    # A smoke test on a few documents uses configs/smoke.yaml, a data dir of its own.
     "chunk": Stage("Stage 2: CanonicalDoc -> chunks for every (method, overlap) + size stats",
-                   ("chunkeval.corpus.chunking:run",), ("corpora", "limit")),
+                   ("chunkeval.corpus.chunking:run",), ("corpora",)),
     "embed": Stage("Stage 2b: embed chunks with bge-m3 (primary) and Qwen3-Embedding (secondary), cached (GPU)",
                    ("chunkeval.corpus.embedding:run",), ("corpora", "embedders")),
     "index": Stage("Stage 3: load chunks + both named vectors into the v2 Weaviate collections",

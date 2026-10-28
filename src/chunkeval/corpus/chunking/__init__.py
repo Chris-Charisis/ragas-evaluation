@@ -37,19 +37,21 @@ def build_chunker(method: str, overlap: bool, cfg: Config, counter: TokenCounter
     return CHUNKERS[method](counter, c.target_tokens, overlap, c.overlap_ratio, c.max_tokens, **extra)
 
 
-def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = None) -> None:
-    """CLI entry (`chunkeval chunk`): chunk the parsed documents of each corpus in `corpora` with
-    every (method, overlap) of the config. `limit`: only the first N documents per corpus.
+def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
+    """CLI entry (`chunkeval chunk`): chunk every parsed document of each corpus in `corpora` with
+    every (method, overlap) of the config.
 
-    Docs are sorted by name, so `limit` always picks the same ones. Each variant goes to its own
-    JSONL (atomic write, so a crash never leaves a half-written file that `embed` would read);
-    the character window is calibrated on the docs being chunked, so a `--limit` smoke test gets a
-    slightly different window than the full corpus.
+    No `limit`: the chunk files are per corpus, so chunking a few documents would replace the full
+    corpus's files (and an `embed` after it, their vectors). A smoke test parses a few documents into
+    a data dir of its own (configs/smoke.yaml) and chunks them all. Each variant goes to its own
+    JSONL (atomic write, so a crash never leaves a half-written file that `embed` would read); the
+    character window is calibrated on the docs being chunked, so a smoke data dir gets a slightly
+    different window than the full corpus.
     """
     counter = load_counter(cfg.chunking.size_tokenizer, cfg.chunking.size_tokenizer_revision)
     for corpus in corpora:
         parsed_dir = cfg.paths.data_dir / "parsed" / corpus
-        paths = sorted(parsed_dir.glob("*.json"))[:limit]
+        paths = sorted(parsed_dir.glob("*.json"))
         if not paths:
             raise FileNotFoundError(f"corpus '{corpus}': no parsed docs in {parsed_dir}, run `chunkeval parse` first")
         docs = [load_doc(p) for p in paths]

@@ -84,6 +84,8 @@ def test_options_only_where_declared():
     assert (args.corpora, args.limit, args.verbose) == (["papers"], 2, True)
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["report", "--corpus", "papers"])    # report has no --corpus
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["chunk", "--limit", "2"])           # it would replace the corpus's chunk files
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "two"])

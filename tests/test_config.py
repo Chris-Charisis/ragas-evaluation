@@ -89,6 +89,28 @@ def test_another_data_dir_gets_its_own_vectors_and_collections(tmp_path):
     assert default.embedding_cache_dir == tmp_path / "data" / "embeddings"
 
 
+def test_smoke_config_is_a_workspace_of_its_own():
+    """configs/smoke.yaml: the default settings in its own data dir, run and collections, so a smoke test
+    never touches data/ or a run; only the LLM caches are shared, and the judge is capped low."""
+    default, smoke = load_config(DEFAULT_CONFIG), load_config(REPO_ROOT / "configs" / "smoke.yaml")
+    assert smoke.run_id != default.run_id and smoke.paths.runs_dir == default.paths.runs_dir
+    assert smoke.paths.data_dir == REPO_ROOT / "data" / "smoke"
+    assert smoke.embedding_cache_dir == REPO_ROOT / "data" / "smoke" / "embeddings"
+    assert collection_name(smoke, "papers", "sentence", True) == "Smoke_papers_sentence_overlap_v2"
+    assert smoke.paths.llm_cache_dir == default.paths.llm_cache_dir
+    assert smoke.ragas.max_cost_usd <= 1
+    # everything else as in the default config, so the smoke test runs the real settings
+    same = {"paths": {"data_dir"}, "run_id": True, "ragas": {"max_cost_usd"}}
+    for section, value in default.model_dump().items():
+        if same.get(section) is True:
+            continue
+        theirs = smoke.model_dump()[section]
+        if isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k not in same.get(section, set())}
+            theirs = {k: v for k, v in theirs.items() if k not in same.get(section, set())}
+        assert theirs == value, section
+
+
 @pytest.mark.parametrize("data_dir, namespace", [
     ("data", ""), ("data/size512", "size512"), ("data/a/b-c", "a_b_c"), ("other", "other")])
 def test_workspace_namespace(data_dir, namespace):

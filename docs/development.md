@@ -132,6 +132,22 @@ For only some of the existing corpora, an overlay leaves the others out (`paths.
 
 A corpus left out of a config is still in `data/`: `filter-qa` carries its lines over, its collections stay, and `parse` keeps its doc ids reserved. Adding it back costs nothing.
 
+**4. A smoke test of the whole chain on a few documents.** `configs/smoke.yaml` gives it a workspace of its own: `data/smoke/`, `runs/smoke/` and the collections `Smoke_*`. Nothing of `data/` or of another run is touched; only the LLM caches are shared. `parse --limit` picks the documents, and every later stage takes all of them:
+```bash
+C="--config configs/smoke.yaml"
+uv run chunkeval parse $C --limit 2      # the first 2 PDFs of each corpus
+uv run chunkeval chunk $C                # from here on: every document parsed above
+uv run chunkeval embed $C
+uv run chunkeval index $C
+uv run chunkeval gen-qa $C
+uv run chunkeval filter-qa $C
+uv run chunkeval retrieve $C
+uv run chunkeval answer $C
+uv run chunkeval eval $C --dry-run       # then without --dry-run: paid, capped at $1 (ragas.max_cost_usd)
+uv run chunkeval report $C
+```
+The character window is calibrated on these few documents, so their chunks differ a little from the full corpus's. To start over, delete `data/smoke/` and `runs/smoke/`. The next `index` then refuses the old `Smoke_*` collections, which were built from other chunks, until you run it with `--recreate`.
+
 ### Removing a corpus for good
 
 ```bash

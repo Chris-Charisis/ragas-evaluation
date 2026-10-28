@@ -1,0 +1,17 @@
+# A smoke test of the whole chain on a few documents, in a workspace of its own: data/smoke/ (parsed
+# docs, chunks, vectors, questions), runs/smoke/ and the Weaviate collections Smoke_*. Nothing of
+# data/ or of another run is read or written, except the shared LLM caches (paths.llm_cache_dir: keyed
+# by everything that decides a call, so a hit is always the same call).
+# `parse --limit N` picks the documents (the first N PDFs of each corpus); every later stage takes all
+# of them. The commands: docs/development.md, "Configs for other experiments".
+extends: default.yaml
+
+run_id: "smoke"
+
+paths:
+  data_dir: "data/smoke"
+
+ragas:
+  # The judge is the one paid stage. A few documents' questions cost cents (~$0.01 per question across
+  # its 7 setups with gpt-6-luna); the cap stops anything bigger, e.g. a parse without --limit.
+  max_cost_usd: 1
