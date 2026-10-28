@@ -32,7 +32,8 @@ embedding.primary), and response_words.
 How Ragas is called: one Ragas prompt at a time (`Judge.ask`), not through `ragas.evaluate`, because
   - every judge call is cached in ragas_cache.jsonl as soon as it returns, keyed by its rendered prompt
     (instruction, examples, input) and the judge settings, so nothing is paid twice: a re-run asks only
-    what is new, a crash loses only the calls in flight, and identical calls are asked once (on the dev
+    what is new, a crash loses only the calls in flight, another run_id or data dir asks only the calls
+    no run has made (one cache, paths.llm_cache_dir), and identical calls are asked once (on the dev
     docs: a chunk judged for the same question in several setups, 16% of the context-precision calls;
     the same answer in several setups, 27% of the answer-only calls; the gold answer's claims, once per
     question instead of once per setup);
@@ -75,7 +76,7 @@ Reads:  runs/<run_id>/answers/<corpus>_<setup>.jsonl (up to date: `chunkeval ans
 Writes: runs/<run_id>/ragas/per_question.parquet   one row per (question_id, corpus, setup)
         runs/<run_id>/ragas/details.jsonl          per row: the judge's verdicts, reasons, statements, claims
         runs/<run_id>/ragas/cost.json              calls, tokens and USD: this run, and all the table rests on
-        runs/<run_id>/ragas_cache.jsonl            every judge call (append-only cache, see above)
+        data/llm_cache/ragas_cache.jsonl           every judge call (append-only cache, see above)
         runs/<run_id>/ragas_summary.json           means and NaN counts per corpus and setup
 """
 from __future__ import annotations
@@ -614,7 +615,7 @@ def load_corpus_answers(cfg: Config, corpus: str, pairs: list[QAPair]) -> dict[s
     """setup -> question_id -> Answer for a corpus's whole question set `pairs`. Refuses an answer file
     that is missing or was made for other questions, retrieval, top_k, document titles or answer prompt
     than the current ones (what `chunkeval answer` would redo), so no row scores an answer to something else."""
-    prompt_sha = hashlib.sha256(answering.PROMPT_PATH.read_bytes()).hexdigest()
+    prompt_sha = answering.prompt_sha256(cfg)
     titles_sha = answering.titles_sha256(answering.doc_titles(cfg, corpus))
     by_setup = {}
     for method, overlap, setup in setups(cfg):
@@ -688,8 +689,8 @@ def cost_totals(records: list[Record]) -> dict[str, Any]:
 # --- outputs --------------------------------------------------------------------------------------
 
 def ragas_cache_path(cfg: Config) -> Path:
-    """runs/<run_id>/ragas_cache.jsonl, outside ragas/ so that folder holds the stage's results only."""
-    return cfg.paths.runs_dir / cfg.run_id / "ragas_cache.jsonl"
+    """<paths.llm_cache_dir>/ragas_cache.jsonl: one cache for every run_id and data dir."""
+    return cfg.paths.llm_cache_dir / "ragas_cache.jsonl"
 
 
 def details(qa: QAPair, a: Answer, judged: dict[str, Any]) -> dict[str, Any]:

@@ -1,7 +1,7 @@
 # Ragas evaluation pipeline
 
 Which way of chunking documents gives the best retrieval and the best answers in our agricultural RAG
-system? chunkeval compares 3 chunking methods (fixed-size character windows, whole sentences, and whole sentences
+system? Chunkeval module compares 3 chunking methods (fixed-size character windows, whole sentences, and whole sentences
 within one section), each with and without overlap, on two corpora:
 - **papers**: 150 structured scientific papers
 - **reports**: 150 free-format reports
@@ -63,11 +63,11 @@ uv run chunkeval gen-qa --config configs/other.yaml -v # another config, debug l
 `uv run python -m chunkeval.cli …` does the same without the console script. Both work from any directory, because `uv sync` installs the package (see [Development](docs/development.md#package-layout)).
 
 **Options:**
-- **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging.
-- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `audit`, `embed`, `retrieve`, `answer` and `eval` have `--corpus` only.
+- **On every stage:** `--config` (default `configs/default.yaml`, relative to the repo root) and `-v` for debug logging. A config for another experiment can start with `extends: default.yaml` and hold only what differs ([configs for other experiments](docs/development.md#configs-for-other-experiments)).
+- **`--corpus NAME`** (repeatable; default: every corpus) **and `--limit N`** (the first N documents per corpus, sorted by name, so a smoke test always picks the same ones). For now these exist on `parse`, `chunk`, `index` and `gen-qa`; `audit`, `embed`, `filter-qa`, `retrieve`, `answer` and `eval` have `--corpus` only.
 - **`--pilot N`** and **`--dry-run`** on `eval`: only the first N questions of each corpus's Ragas sample; or only the cost estimate, with no API call (see [Ragas evaluation](docs/evaluation.md#ragas-evaluation-eval)).
 - **`--embedder NAME`** on `embed` (repeatable; default: `embedding.primary`, then `embedding.secondary`) and on `retrieve` (default: `retrieval.embedders`).
-- **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [Index](docs/corpus.md#index-index)). On `gen-qa`: delete every Q-A record, of all corpora, and generate again (see [Q-A generation](docs/qa.md#q-a-generation-gen-qa)).
+- **`--recreate`** on `index`: delete and rebuild the selected collections even when they exist (see [Index](docs/corpus.md#index-index)). On `gen-qa`: delete the Q-A records of the selected corpora, and generate them again; the other corpora's records stay (see [Q-A generation](docs/qa.md#q-a-generation-gen-qa)).
 
 Every stage logs to the console and to `runs/<id>/logs/`, saves the config it used to `runs/<id>/config.yaml`, and stops in the first second on a config error or a missing secret ([what the CLI does around a stage](docs/development.md#the-cli)).
 
@@ -80,7 +80,7 @@ Every stage logs to the console and to `runs/<id>/logs/`, saves the config it us
 5. **Correct Ragas inputs:** `user_input` = question, `retrieved_contexts` = the top-k chunks, each with its document's title as the generator read it, `response` = the RAG answer, `reference` = the gold answer. The old script used the gold answer as `response` and the source chunk as `reference`.
 6. **Local models where possible, one paid judge.** On Ollama: `gemma4:12b-it-q8_0` writes the Q-A pairs (as the derived all-GPU tag `gemma4-allgpu`), `gpt-oss:20b` is the critic, `qwen3.5:9b-q8_0` writes the RAG answers. Three different families, so no model judges its own text. The judge is OpenAI's `gpt-6-luna` with reasoning off, chosen over `gpt-4.1-mini-2025-04-14` after both judged the same pilot ([evaluation](docs/evaluation.md#the-judge-gpt-6-luna-instead-of-gpt-41-mini-2026-10-21)).
 7. **Metrics:** span-based retrieval metrics (hit@k, span recall@k, MRR, IoU and precision, context tokens), the 4 Ragas metrics plus factual correctness, judge-free text metrics, all stored per question, with bootstrap CIs, paired comparisons and a budget-matched view.
-8. **Never pay twice.** Every LLM stage keeps what it was told: `gen-qa` saves each unit's outcome as it arrives, and the critic, the RAG generator and the judge cache every call under a hash of what decides it. A re-run or a crash never asks again what was already answered, and the judge refuses to start above a cost cap (`ragas.max_cost_usd`).
+8. **Never pay twice.** Every LLM stage keeps what it was told: `gen-qa` saves each unit's outcome as it arrives, and the critic, the RAG generator and the judge cache every call under a hash of what decides it. The answer and judge caches are shared by every run and data dir (`data/llm_cache/`). A re-run, a crash or a new `run_id` never asks again what was already answered, and the judge refuses to start above a cost cap (`ragas.max_cost_usd`).
 
 ## Documentation
 
@@ -92,7 +92,7 @@ Every stage logs to the console and to `runs/<id>/logs/`, saves the config it us
 | [docs/qa.md](docs/qa.md) | Q-A generation and filtering, hand labelling |
 | [docs/evaluation.md](docs/evaluation.md) | Retrieval and span metrics, RAG answers, Ragas evaluation and its cost guard |
 | [docs/report.md](docs/report.md) | The report: statistics, the ranking rule, what it shows |
-| [docs/development.md](docs/development.md) | Package layout, conventions, the CLI, testing, dependencies |
+| [docs/development.md](docs/development.md) | Package layout, conventions, the CLI, configs for other experiments, testing, dependencies |
 | [docs/future-work.md](docs/future-work.md) | Extensions considered and left out for now |
 
 Each stage's doc says what it does, what it writes, the decisions behind its settings, and what was found on the dev docs and on the full corpus.

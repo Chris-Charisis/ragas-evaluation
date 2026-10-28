@@ -160,7 +160,7 @@ def query_settings(spec: EmbedderSpec) -> dict[str, Any]:
 
 def query_cache_path(cfg: Config, embedder: str, corpus: str) -> Path:
     """data/embeddings/queries/<embedder>/<corpus>.npy; its metadata is the .json next to it."""
-    return cfg.embedding.cache_dir / "queries" / embedder / f"{corpus}.npy"
+    return cfg.embedding_cache_dir / "queries" / embedder / f"{corpus}.npy"
 
 
 def cached_query_vectors(cfg: Config, spec: EmbedderSpec, corpus: str, pairs: list[QAPair]) -> np.ndarray | None:

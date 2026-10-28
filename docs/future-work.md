@@ -14,7 +14,7 @@ An optional extension for after the whole pipeline is complete, built only if we
 - **Open design points:**
   - **Compare at equal context.** At a fixed top-k, bigger chunks win recall almost automatically. Use the budget-matched view (`retrieval.budget_tokens`, scaled per size) as the main comparison.
   - **A cap per size.** 1024 is above `max_tokens: 512`, and the schema rejects a target above the cap. Use something like 2× the size per sweep size.
-  - **Naming.** The extra chunk files and Weaviate collections need the size in their names, which `weaviate.collection_template` can't express yet.
+  - **Naming.** In one data dir, the extra chunk files and Weaviate collections need the size in their names, which `weaviate.collection_template` can't express yet. One data dir per size works today: an `extends` config with `paths.data_dir: data/size512` gets its own vectors and collections (see [configs for other experiments](development.md#configs-for-other-experiments)), but the report then covers one size per run.
   - **Weaviate memory.** Raise `GOMEMLIMIT` (see [setup.md](setup.md#weaviate-docker)).
 
 ## Citations in the RAG answers
@@ -34,6 +34,14 @@ Not a stage (decided 2026-10-11). Run once by hand on 2026-10-21, in the trial t
 ## A stratified Ragas sample
 
 Not implemented (2026-10-12). When a corpus has more questions than `ragas.sample_per_corpus`, `eval` scores a seeded random subset (`ragas_sample`), so by chance it can over- or under-represent a document, a question type or the two-span pairs. A stratified draw would keep the question set's mix, e.g. proportionally per document and question type, while staying nested (a pilot is still the start of the full sample). It matters now: the full corpus has more questions than `ragas.sample_per_corpus` (500) in both corpora. The alternative is to score every question: about $0.04 each, ~$40 per 1,000 questions.
+
+## Document ids unique across corpora
+
+Not implemented (2026-10-28). A document's id is its file name without `.pdf`, and nothing checks that it occurs in one corpus only. Question ids are `<doc_id>:<unit_id>`, with no corpus in them, so a new corpus with a file named like an existing one (`paper_12.pdf`) would collide:
+- `gen-qa` treats a unit as done when its id is in `raw.jsonl`, so the new corpus's units with an already used id would be skipped silently;
+- the report indexes the questions by id alone (`analysis/inputs.py`), so two corpora's questions would merge.
+
+The fix is a check in `parse` (or the config) that refuses a doc id another configured corpus already has, naming both files. Changing the question ids to include the corpus instead would change every hash: the Ragas sample is drawn by `sha256(seed|id)`, so the sample would be new and the judge paid again. Until then, give a new corpus's files their own prefix (`thesis_<i>.pdf`, see [rerun.md](rerun.md#6b-a-new-corpus)).
 
 ## Models on our own servers
 

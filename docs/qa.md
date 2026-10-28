@@ -9,7 +9,7 @@ stage evaluates (`data/qa/filtered.jsonl`).
 ```bash
 uv run chunkeval gen-qa --corpus papers --limit 1   # smoke test: one paper, ~20 s after the ~25 s Ollama preflight
 uv run chunkeval gen-qa                             # every corpus; resumes where an earlier run stopped
-uv run chunkeval gen-qa --recreate                  # delete ALL Q-A records (every corpus) and start over
+uv run chunkeval gen-qa --corpus papers --recreate  # delete the papers records only and start papers over
 ```
 
 **What it does,** per document (`qa/generation.py`), with `llm.qa_generator` (`gemma4-allgpu:12b-it-q8_0` since 2026-10-19):
@@ -18,7 +18,7 @@ uv run chunkeval gen-qa --recreate                  # delete ALL Q-A records (ev
   - A **two-span** unit is two adjacent whole paragraphs, also across a section boundary; the question must need both. **On, at 0.2** since 2026-10-19: off with Qwen, which rarely gave a question from them; back on with Gemma, whose single-unit evidence rarely crosses a chunk boundary (see [Checks on the full corpus](#checks-on-the-full-corpus)).
   - A paragraph over the max is cut into sentence groups. A single "sentence" over the max is never used (garbled OCR in practice).
   - Sections that `skip_section_titles` names, or with less text than the minimum, give no unit.
-- **One question per call,** with the prompt in [prompts/qa_generation.md](../prompts/qa_generation.md); its notes explain the file format.
+- **One question per call,** with the prompt `prompts.qa_generation` ([prompts/qa_generation.md](../prompts/qa_generation.md)); its notes explain the file format.
   - Question types rotate per document. `numeric` passes to the next type for a unit without a digit.
   - A single unit's skip of another type is asked once more as `factoid`; a two-span skip is final.
 - **Evidence** (`locate_quote`): each quote is searched only inside the unit, first exactly, then normalized, then fuzzy at `qa.fuzzy_match_threshold`. A pair needs every quote located, and in a two-span unit at least one quote in each passage.
@@ -30,12 +30,14 @@ uv run chunkeval gen-qa --recreate                  # delete ALL Q-A records (ev
 - **Summary:** logged and written to `runs/<run_id>/gen_qa_summary.json`. Per corpus: units, pairs, pair rate, drops by reason, how the evidence was located, and the question types.
 
 **Resume and provenance.** `data/qa/raw.provenance.json` records what decides a unit's outcome:
-- the generator (model, settings, Ollama digest), the prompt file's hash, the seed, the size tokenizer, `skip_section_titles`, the `qa` settings that shape units, and `GENERATION_VERSION` (bumped when the code changes its output);
+- per corpus, the generator (model, settings, Ollama digest), the prompt text's hash, the seed, the size tokenizer, `skip_section_titles`, the `qa` settings that shape units, and `GENERATION_VERSION` (bumped when the code changes its output);
 - a text hash of every document that has records.
 
-On a re-run:
+On a re-run, each corpus asked for (`--corpus`, default every configured corpus) is checked against its own settings:
 - with the same values, only units that are in neither file are asked;
-- with any difference, the run is refused and the differing keys are named. `--recreate` deletes the records of every corpus, because the settings are shared.
+- with any difference, the run is refused and the corpus and the differing keys are named. `--recreate` deletes the records of the corpora asked for only; the other corpora's records stay as they are.
+
+So a new corpus can be generated with other settings than the existing ones; the report then warns that the corpora's questions were made differently. A provenance file from before 2026-10-28 holds one set of settings for every corpus; it is read as that set for each, and the next run writes it per corpus.
 
 `qa.docs_per_corpus` and `--limit` only choose which documents are used, so the full run resumes a `--limit` smoke test.
 
@@ -66,7 +68,8 @@ On a re-run:
 ## Q-A filtering (`filter-qa`)
 
 ```bash
-uv run chunkeval filter-qa      # every pair of raw.jsonl; asks the critic only what isn't cached
+uv run chunkeval filter-qa                    # every corpus in the config; asks the critic only what isn't cached
+uv run chunkeval filter-qa --corpus reports   # reports only: the other corpora's lines stay as they are
 ```
 
 **What it does** (`qa/filtering.py`), in three layers, each only on what the one before kept:
@@ -74,21 +77,25 @@ uv run chunkeval filter-qa      # every pair of raw.jsonl; asks the critic only 
    - **On the question:** a reference to its source ("this study", "according to the passage", "described in the abstract", "for the study", "the authors"), a pronoun opening, a figure, table or section number, no final "?", two questions in one, fewer than 5 or more than 40 words. These are case-insensitive regexes; the old `phrase_blacklist` was case-sensitive. "in the context of <topic>" is allowed, because good questions use it to name their topic.
    - **On the answer:** an abstention ("the passage does not mention…", "N/A"). Also, every number in the answer must appear in the located evidence or in the question, in digits or in words there. A number found only elsewhere in the passage means the gold evidence misses part of the answer; on the dev docs this caught "less than 10 kg", which was in the passage but not in the quote.
    - An answer that repeats a quote word for word is fine, as long as it answers the question (decided 2026-10-11).
-2. **The critic** (`llm.qa_critic`, gpt-oss:20b, a different family from the Gemma generator), with the prompt in [prompts/qa_critic.md](../prompts/qa_critic.md). Its notes explain each choice. It is called **twice per pair**:
+2. **The critic** (`llm.qa_critic`, gpt-oss:20b, a different family from the Gemma generator), with the prompt `prompts.qa_critic` ([prompts/qa_critic.md](../prompts/qa_critic.md)). Its notes explain each choice. It is called **twice per pair**:
    - **The passage call** sees the passage, question, answer and evidence, and judges the answer: `groundedness`, `answerability`, plus `needs_both` for a two-span pair, when they are on (one passage alone mustn't answer it).
    - **The question call** sees the question alone, as a user of the retrieval system does, and judges the question: `standalone`, `specificity` (one clear answer among hundreds of documents), `usefulness`.
    - Each call first writes a note the scores rest on: `question_asks_for` and `unresolved_references`. Then it gives a reason and a score from 1 to 5 per criterion.
    - **The decision is made in code** (`decide`): every criterion must reach `qa.critic_min_score`. Changing the threshold asks nothing again.
-3. **De-duplication** (`deduplicate`): questions are embedded with bge-m3 (`embedding.primary`) once the critic is unloaded. A question is removed when its cosine to an already kept question of the same corpus is above `qa.dedup_cosine_threshold`. The pair kept is a two-span one (the scarce kind), else the one with the higher total critic score.
+3. **De-duplication** (`deduplicate`): questions are embedded with bge-m3 (`embedding.primary`) once the critic is unloaded. A question is removed when its cosine to an already kept question of the same corpus is above `qa.dedup_cosine_threshold`. The pair kept is a two-span one (the scarce kind), else the one with the higher total critic score. The vectors are cached by question text (`dedup_vectors`), so only new questions are encoded: fp16 batches pad differently when other questions are in them, which would move a cosine in its last digits on every run. The first run after 2026-10-28 encodes every question once more, since the 2026-10-20 vectors weren't kept.
 
 Every pair that passes is kept, with no down-sampling (decided 2026-10-11). `filtered.jsonl` is the final question set: every later stage evaluates exactly its question ids, and Ragas draws its own subset of it.
+
+**Per corpus.** Every layer works within one corpus, so `--corpus` filters only the corpora asked for, and carries the other corpora's lines of `filtered.jsonl` and `rejected.jsonl` over exactly as the last run wrote them: what a full run would give them. A warning names a carried corpus whose pairs in `raw.jsonl` have changed since (`gen-qa` ran for it), with the command to filter it again. A corpus that is in `raw.jsonl` but not in the config is carried over too.
 
 **What it writes:**
 - **`data/qa/filtered.jsonl`:** the kept `QAPair`s in document order, with the critic's output in `meta.filter.critic`.
 - **`data/qa/rejected.jsonl`:** every other pair, with `meta.filter`: `stage` (`checks`, `critic`, `dedup`), `reasons` (e.g. `source_reference: 'this study'`, `critic_specificity: 3`, `duplicate_of: <id> (0.95)`) and the critic's output, so the filter can be audited.
+- **`data/qa/filtered.provenance.json`:** per corpus, what decided its lines: the critic (model, settings, Ollama digest, seed, `CRITIC_VERSION`), the critic prompt's hash, `critic_min_score`, the de-duplication's embedder and `dedup_cosine_threshold`. The report shows it per corpus and warns when the corpora of a run differ. A corpus last filtered before 2026-10-28 has no entry until it is filtered again.
+- **`data/embeddings/dedup/<embedder>/<corpus>.npy`** (+ `.json`): the de-duplication's question vectors, keyed by question text.
 - **`data/qa/critic_scores.jsonl`:** the critic's answers, one line per pair and call, appended as they arrive. This is a cache: each line is keyed by a hash of everything that decides it (the messages, the schema, the critic's model, settings and Ollama digest, `CRITIC_VERSION`). A re-run asks only what is new: new pairs, a changed pair's call, or every call after a prompt or critic change. An answer the critic couldn't produce (cut off, invalid JSON) is cached too and rejects its pair (`critic_bad_output`). API errors stop the stage before anything is written; a re-run asks exactly those.
 - **Summary:** logged and written to `runs/<run_id>/filter_qa_summary.json`. Per corpus: pairs, kept, `keep_rate`, rejections by stage and by reason, each criterion's mean and count below the minimum, and the kept pairs by question type and kind.
-- **`runs/<run_id>/filter_qa_labelling.csv`:** 50 pairs for hand labelling (see below). It is written once and never overwritten; delete it to draw a new sample.
+- **`runs/<run_id>/filter_qa_labelling.csv`:** 50 pairs for hand labelling (see below), drawn from the corpora this run filtered. It is written once and never overwritten; delete it to draw a new sample.
 
 **Hand labelling, to calibrate the threshold.** Do it on the final corpus, with a new `run_id`.
 - **The sample:** half of it is kept pairs, half pairs rejected by the checks or the critic (duplicates are good pairs, not a verdict). The rows are shuffled and carry the passage and evidence, but not the filter's decision, so the labels can't be biased by it.

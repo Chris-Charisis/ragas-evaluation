@@ -1,3 +1,4 @@
+import re
 import string
 from typing import Annotated, Any, Literal
 
@@ -37,6 +38,9 @@ class StrictConfig(BaseModel):
 class Paths(StrictConfig):
     data_dir: Path
     runs_dir: Path
+    # The answer and judge caches (answering.py, ragas_eval.py): keyed by everything that decides a
+    # call, so they serve every run_id and data dir, and no call is paid twice.
+    llm_cache_dir: Path
     corpora: dict[str, Path]
 
 
@@ -44,6 +48,7 @@ class Paths(StrictConfig):
     def resolve_against_repo_root(self):
         self.data_dir = REPO_ROOT / self.data_dir
         self.runs_dir = REPO_ROOT / self.runs_dir
+        self.llm_cache_dir = REPO_ROOT / self.llm_cache_dir
         self.corpora = {name: REPO_ROOT / p for name, p in self.corpora.items()}
         return self
 
@@ -90,7 +95,7 @@ class Embedding(StrictConfig):
     primary: str
     secondary: list[str]
     batch_size: int = Field(gt=0)
-    cache_dir: Path
+    cache_dir: Path | None = None        # None: <paths.data_dir>/embeddings (Config.embedding_cache_dir)
     models: dict[VectorName, EmbModel]
 
     @model_validator(mode="after")
@@ -102,7 +107,8 @@ class Embedding(StrictConfig):
         # `embed` would embed (and the analysis count) such an embedder twice
         if len(set(names)) != len(names):
             raise ValueError(f"an embedder is listed twice in primary + secondary: {names}")
-        self.cache_dir = REPO_ROOT / self.cache_dir
+        if self.cache_dir is not None:
+            self.cache_dir = REPO_ROOT / self.cache_dir
         return self
 
 class Chunking(StrictConfig):
@@ -122,19 +128,46 @@ class Chunking(StrictConfig):
             raise ValueError(f"target_tokens ({self.target_tokens}) > max_tokens ({self.max_tokens})")
         return self
 
+def template_fields(template: str) -> set[str]:
+    """The {placeholders} of a format string."""
+    return {f for _, f, _, _ in string.Formatter().parse(template) if f is not None}
+
+
+# A collection name part: Weaviate names start with a letter and hold letters, digits and underscores.
+NAMESPACE = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)?$")
+
+
+def workspace_namespace(data_dir: Path) -> str:
+    """The collection namespace of a data dir: "" for the repo's data/, else its path without a
+    leading data/, as one name part: data/size512 -> "size512", data/a/b -> "a_b". So two data dirs
+    with the same corpus names never share (and `index --recreate` never replaces) a collection."""
+    try:
+        parts = data_dir.relative_to(REPO_ROOT).parts
+    except ValueError:
+        parts = data_dir.parts[1:]           # outside the repo: the absolute path, without its root
+    if parts[:1] == ("data",):
+        parts = parts[1:]
+    return re.sub(r"[^A-Za-z0-9_]", "_", "_".join(parts))
+
+
 class Weaviate(StrictConfig):
     host: str
     port: int = Field(ge=1, le=65535)
     grpc_port: int = Field(ge=1, le=65535)
     collection_template: str
+    namespace: str | None = None         # None: from paths.data_dir (workspace_namespace)
 
     @model_validator(mode="after")
     def check_template_placeholders(self):
         # all three are needed, or two configs would share (and overwrite) one collection
-        fields = {f for _, f, _, _ in string.Formatter().parse(self.collection_template) if f is not None}
+        fields = template_fields(self.collection_template) - {"namespace"}
         expected = {"corpus", "method", "overlap"}
         if fields != expected:
-            raise ValueError(f"collection_template placeholders must be {sorted(expected)}, got {sorted(fields)}")
+            raise ValueError(f"collection_template placeholders must be {sorted(expected)} (and optionally "
+                             f"namespace), got {sorted(fields)}")
+        if self.namespace is not None and not NAMESPACE.match(self.namespace):
+            raise ValueError(f"weaviate.namespace {self.namespace!r}: letters, digits and underscores, "
+                             f"starting with a letter (or \"\" for none)")
         return self
 
 class Ollama(StrictConfig):
@@ -157,6 +190,23 @@ class LLM(StrictConfig):
     qa_critic: LLMModel
     rag_generator: LLMModel
     judge: LLMModel
+
+
+class Prompts(StrictConfig):
+    """The prompt files of the local LLM roles, relative to the repo root. Their text is in every
+    provenance record and cache key (a hash, or the rendered messages), not their path."""
+    qa_generation: Path
+    qa_critic: Path
+    rag_answer: Path
+
+    @model_validator(mode="after")
+    def resolve_against_repo_root(self):
+        for name in ("qa_generation", "qa_critic", "rag_answer"):
+            path = REPO_ROOT / getattr(self, name)
+            if not path.is_file():
+                raise ValueError(f"prompts.{name}: no such file {path}")
+            setattr(self, name, path)
+        return self
 
 # Question types the Q-A generator can be asked for (prompts/qa_generation.md defines each one);
 # also the enum of qa.generation.QA_JSON_SCHEMA.
@@ -241,6 +291,7 @@ class Config(StrictConfig):
     weaviate: Weaviate
     ollama: Ollama
     llm: LLM
+    prompts: Prompts
     qa: QA
     retrieval: Retrieval
     ragas: Ragas
@@ -277,7 +328,29 @@ class Config(StrictConfig):
         if judge.provider == "openai" and judge.model not in self.ragas.prices:
             raise ValueError(f"ragas.prices has no price for the judge {judge.model!r}: add it (USD per 1M "
                              f"input and output tokens), so `eval` can estimate and cap its cost")
+
+        # Another data dir's collections would otherwise have this one's names.
+        namespace, w = self.collection_namespace, self.weaviate
+        if not NAMESPACE.match(namespace):
+            raise ValueError(f"the collection namespace from paths.data_dir, {namespace!r}, isn't a valid name part "
+                             f"(letters, digits and underscores, starting with a letter): set weaviate.namespace")
+        if namespace and "namespace" not in template_fields(w.collection_template):
+            raise ValueError(f"weaviate.collection_template has no {{namespace}}, but this data dir's namespace is "
+                             f"{namespace!r}: its collections would replace another data dir's. Add {{namespace}} "
+                             f"to the template, or set weaviate.namespace: \"\" to share them on purpose")
         return self
+
+    @property
+    def embedding_cache_dir(self) -> Path:
+        """embedding.cache_dir, or <paths.data_dir>/embeddings when unset: each data dir its own vectors.
+        Computed on access, so a data_dir changed after loading (tests) takes its cache along."""
+        return self.embedding.cache_dir or self.paths.data_dir / "embeddings"
+
+    @property
+    def collection_namespace(self) -> str:
+        """weaviate.namespace, or the one paths.data_dir gives (`workspace_namespace`): "" for data/."""
+        w = self.weaviate.namespace
+        return w if w is not None else workspace_namespace(self.paths.data_dir)
 
     @model_validator(mode="after")
     def check_no_placeholders(self):

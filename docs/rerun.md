@@ -251,11 +251,15 @@ printf 'corpus,doc_id,title\n' > configs/titles.csv
 The corpus names stay `papers` and `reports`. Other names would need the keys of `paths.corpora` and
 `parsing.body` in `configs/default.yaml` renamed, and the first column of `configs/titles.csv`.
 
+To add a corpus next to `papers` and `reports` instead of replacing them, on its own or in one run with
+them, see [configs for other experiments](development.md#configs-for-other-experiments).
+
 ## 7. Settings for the run
 
-Everything a stage writes outside `data/` goes to `runs/<run_id>/`, including the generator's and the
-judge's caches and the labelling sample. Give this run its own id, so its results are never mixed with
-another machine's or another corpus's:
+Everything a stage writes outside `data/` goes to `runs/<run_id>/`, including the labelling sample. The
+answer and judge caches are in `data/llm_cache/`, shared by every run: their keys hold everything that
+decides a call, so a hit is always the same call. Give this run its own id, so its results are never
+mixed with another machine's or another corpus's:
 
 ```bash
 sed -i -E 's/^run_id: "[^"]*"/run_id: "full_data-v2.0"/' configs/default.yaml
@@ -449,9 +453,9 @@ cat runs/full_data-v2.0/ragas/cost.json      # compare with the estimate
 uv run chunkeval eval                        # the whole sample; reuses what the pilot paid for
 ```
 
-The stage never pays for a call twice: every judge call is cached in `runs/<run_id>/ragas_cache.jsonl` as
-it returns, and an interrupted run continues where it stopped. It stops by itself when the spend reaches
-the cap.
+The stage never pays for a call twice: every judge call is cached in `data/llm_cache/ragas_cache.jsonl`
+as it returns, and an interrupted run continues where it stopped. It stops by itself when the spend
+reaches the cap.
 
 ### 8.11 Report
 
@@ -492,7 +496,7 @@ rsync -a ~/ragas-evaluation/data/qa/ USER@SOURCE_HOST:~/ragas-evaluation/data/qa
 | Weaviate 401 | `.env`'s key changed after the container started: `docker compose up -d --force-recreate`. |
 | Weaviate timeouts or gRPC errors | Port 50051 not mapped or the container down: `docker compose ps`. |
 | `index`: `exists, built from other inputs` | Collections from another corpus or `--limit` run: `uv run chunkeval index --recreate`. |
-| `gen-qa` refused, naming settings that differ | A setting, the prompt or a document changed since the records were written. Undo the change, or start over with `uv run chunkeval gen-qa --recreate` (deletes all Q-A records). |
+| `gen-qa` refused, naming settings that differ | A setting, the prompt or a document changed since the corpus's records were written. Undo the change, or start that corpus over with `uv run chunkeval gen-qa --corpus <corpus> --recreate` (deletes its Q-A records only). |
 | `run chunkeval retrieve first` (from `answer` or `report`) | The questions or chunks changed after `retrieve`: run the stage it names, then continue. |
 | `eval` refuses to start | The estimate is above `ragas.max_cost_usd`: lower `ragas.sample_per_corpus` or raise the cap deliberately (8.10). |
 | Throughput drops in the middle of an LLM stage | A model was pushed partly onto the CPU (another GPU process started): free the GPU; the stage resumes on re-run. |

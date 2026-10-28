@@ -18,6 +18,8 @@ from chunkeval.analysis.views import HEADLINE_SPAN, OUTCOMES, bin_order
 from chunkeval.core.schema import REPO_ROOT, Config
 from chunkeval.evaluation.answering import GOLD_PASSAGE, answer_path
 from chunkeval.evaluation.retrieval import stored_provenance
+from chunkeval.qa.filtering import read_filter_provenance
+from chunkeval.qa.generation import qa_paths, read_provenance
 
 # Below this many questions in a corpus, the report opens with a warning: read it as a test.
 SMALL_SET = 100
@@ -131,6 +133,30 @@ def package_version(name: str) -> str:
         return "not installed"
 
 
+def differing(settings: dict[str, dict[str, Any]], corpora: list[str]) -> list[str]:
+    """The settings keys whose value differs between the `corpora` that have a record."""
+    present = [settings[c] for c in corpora if c in settings]
+    keys = dict.fromkeys(key for s in present for key in s)
+    return [key for key in keys if len({json.dumps(s.get(key), sort_keys=True) for s in present}) > 1]
+
+
+def question_settings(cfg: Config, corpora: list[str]) -> dict[str, Any]:
+    """How each corpus's questions were generated (raw.provenance.json) and filtered
+    (filtered.provenance.json; None for a corpus filtered before 2026-10-28), and which settings differ
+    between the corpora: `gen-qa` and `filter-qa` can run per corpus, at different times."""
+    gen, filt = read_provenance(qa_paths(cfg)["provenance"])[0], read_filter_provenance(cfg)
+    by_corpus = {}
+    for c in corpora:
+        g, f = gen.get(c), filt.get(c)
+        by_corpus[c] = {
+            "generation": {"generator": g["generator"]["model"], "digest": (g["generator"].get("digest") or "")[:12],
+                           "prompt_sha256": g["prompt_sha256"][:12]} if g else None,
+            "filter": {"critic": f["critic"]["model"], "digest": (f["critic"].get("digest") or "")[:12],
+                       "prompt_sha256": f["critic_prompt_sha256"][:12], "critic_min_score": f["critic_min_score"],
+                       "dedup_cosine_threshold": f["dedup_cosine_threshold"]} if f else None}
+    return {"by_corpus": by_corpus, "differ": {"gen-qa": differing(gen, corpora), "filter-qa": differing(filt, corpora)}}
+
+
 def run_record(cfg: Config, inputs: Inputs, questions: pd.DataFrame, costs: dict[str, Any], generated: datetime,
                folder: str) -> dict[str, Any]:
     """What this report measured: data, models with their pins, settings, cost. Also written as JSON.
@@ -147,6 +173,7 @@ def run_record(cfg: Config, inputs: Inputs, questions: pd.DataFrame, costs: dict
             "documents_parsed": len([p for p in parsed.glob("*.json") if not p.name.startswith("_")]) if parsed.exists() else None,
             "documents_with_questions": int(q["doc_id"].nunique()), "questions": len(q),
             "ragas_questions": int(q["in_ragas"].sum())}
+    record["questions_made"] = question_settings(cfg, inputs.corpora)
     record["ragas_sample"] = (f"eval --pilot {inputs.pilot}" if inputs.pilot
                               else f"ragas.sample_per_corpus {cfg.ragas.sample_per_corpus}")
     c = cfg.chunking
@@ -225,6 +252,12 @@ def run_record_section(doc: Doc, record: dict[str, Any]) -> None:
     for corpus, c in record["corpora"].items():
         rows.append((f"{corpus}", f"{c['questions']} questions from {c['documents_with_questions']} documents "
                                   f"({c['documents_parsed']} parsed); {c['ragas_questions']} in the Ragas table"))
+    for corpus, made in record["questions_made"]["by_corpus"].items():
+        g, f = made["generation"], made["filter"]
+        gen = f"gen-qa {g['generator']} (digest {g['digest'] or '–'}, prompt {g['prompt_sha256']})" if g else "gen-qa not recorded"
+        filt = (f"filter-qa {f['critic']} (digest {f['digest'] or '–'}, prompt {f['prompt_sha256']}), min score "
+                f"{f['critic_min_score']}, dedup {f['dedup_cosine_threshold']}" if f else "filter-qa not recorded")
+        rows.append((f"{corpus} questions", f"{gen}; {filt}"))
     rows.append(("Ragas sample", record["ragas_sample"]))
     ch = record["chunking"]
     rows.append(("chunking", f"{', '.join(map(label, ch['methods']))} × overlap {ch['overlap']}; target {ch['target_tokens']}, "
@@ -641,6 +674,12 @@ def render(cfg: Config, inputs: Inputs, t: dict[str, pd.DataFrame], figs: dict[s
                           for c, v in small.items())
         doc.add(f"> **Small question set** ({sizes}). Every interval is wide and the by-document intervals are "
                 "unreliable: read this report as a test of the analysis, not as results about the chunkers.")
+    differ = {stage: keys for stage, keys in record["questions_made"]["differ"].items() if keys}
+    if differ:
+        which = "; ".join(f"{stage}: {', '.join(keys)}" for stage, keys in differ.items())
+        doc.add(f"> **The corpora's questions were made with different settings** ({which}; see the run record). "
+                "Comparisons within a corpus are unaffected, but a difference between corpora may come from these "
+                "settings rather than from the documents.")
     how_to_read(doc, cfg)
     run_record_section(doc, record)
     question_set_section(doc, t, summaries, inputs.corpora)

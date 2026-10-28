@@ -14,15 +14,25 @@ statistics in analysis.py depend on it). Ragas draws its own subset from it.
 
 Re-runs: the critic's answers are cached in critic_scores.jsonl, keyed by a hash of everything that
 decides them (`critic_key`). A re-run asks the critic only about pairs whose key is new: new pairs,
-or all of them after a change of prompt or critic. Changing a threshold asks nothing. The checks,
-the decision and the de-duplication run every time and rewrite filtered.jsonl and rejected.jsonl.
+or all of them after a change of prompt or critic. Changing a threshold asks nothing. The question
+vectors of the de-duplication are cached too, by question text (`dedup_vectors`): only new questions
+are encoded, so a re-run never moves a cosine. The checks, the decision and the de-duplication run
+every time and rewrite filtered.jsonl and rejected.jsonl.
+
+Per corpus (`--corpus`): every step works within one corpus (the de-duplication compares questions
+of the same corpus only), so the stage filters only the corpora asked for and carries the other
+corpora's lines of filtered.jsonl and rejected.jsonl over as they are: what a full run would give
+them. What decided each corpus's lines is recorded in filtered.provenance.json (`filter_settings`),
+and the report warns when the corpora of a run were filtered differently.
 
 Reads:  data/qa/raw.jsonl (+ raw.provenance.json), data/parsed/<corpus>/<doc_id>.json
 Writes: data/qa/filtered.jsonl   the QAPairs that passed, the critic's scores in meta["filter"]
         data/qa/rejected.jsonl   every other QAPair, meta["filter"]: stage, reasons, scores
+        data/qa/filtered.provenance.json   the filter settings by corpus
         data/qa/critic_scores.jsonl   the critic's answers (append-only cache, see above)
+        data/embeddings/dedup/<primary embedder>/<corpus>.npy (+ .json)   the question vectors
         runs/<run_id>/filter_qa_summary.json, runs/<run_id>/filter_qa_labelling.csv
-Prompt: prompts/qa_critic.md
+Prompt: prompts.qa_critic (prompts/qa_critic.md)
 """
 from __future__ import annotations
 
@@ -33,6 +43,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from string import Template
 from typing import TYPE_CHECKING, Any, Callable
@@ -44,7 +55,7 @@ from chunkeval.core.llm import ChatLLM, LLMOutputError, LLMResult, ollama_model_
 from chunkeval.core.prompts import load_sections
 from chunkeval.core.schema import REPO_ROOT, Config
 from chunkeval.core.store import append_jsonl, read_jsonl, run_dir, write_json, write_jsonl
-from chunkeval.corpus.embedding import Embedder, check_gpu_free, load_specs
+from chunkeval.corpus.embedding import Embedder, check_gpu_free, load_specs, save_npy
 from chunkeval.corpus.parsing import load_doc
 from chunkeval.qa.generation import QAPair, load_pairs, qa_paths, render_passages, text_sha256
 
@@ -192,6 +203,7 @@ CALL_CRITERIA: dict[str, tuple[str, ...]] = {
 TWO_SPAN_CRITERION = "needs_both"
 CRITERIA: tuple[str, ...] = (*CALL_CRITERIA["passage"], TWO_SPAN_CRITERION, *CALL_CRITERIA["question"])
 
+# The shipped prompt, the default of `load_critic_prompt`; the stage reads cfg.prompts.qa_critic.
 CRITIC_PROMPT_PATH = REPO_ROOT / "prompts" / "qa_critic.md"
 # The sections of the prompt file and the placeholders each must use (the system ones are sent as is).
 CRITIC_PROMPT_SECTIONS: dict[str, set[str] | None] = {
@@ -235,15 +247,16 @@ def load_critic_prompt(path: Path = CRITIC_PROMPT_PATH) -> dict[str, str]:
     return load_sections(path, CRITIC_PROMPT_SECTIONS)
 
 
-def build_critic_messages(doc: "CanonicalDoc", qa: QAPair, call: str) -> list[dict[str, str]]:
-    """System + user chat messages for one call about one pair, from prompts/qa_critic.md.
+def build_critic_messages(doc: "CanonicalDoc", qa: QAPair, call: str,
+                          prompt_path: Path = CRITIC_PROMPT_PATH) -> list[dict[str, str]]:
+    """System + user chat messages for one call about one pair, from the prompt file (cfg.prompts.qa_critic).
 
     Each system message is the same for every call of its kind. The "passage" user message holds
     the document title, the unit's passages as the generator saw them (A and B for a two-span
     pair), the question, the answer and the evidence as located in the passage (not the model's
     quote, which may differ slightly). The "question" user message holds the question only.
     """
-    prompt = load_critic_prompt()
+    prompt = load_critic_prompt(prompt_path)
     if call == "question":
         user = Template(prompt["user_question"]).substitute(question=qa.question)
     else:
@@ -267,7 +280,7 @@ def critic_key(messages: list[dict[str, str]], schema: dict[str, Any], critic: d
 def critic_scores(pairs: list[QAPair], docs: dict[tuple[str, str], "CanonicalDoc"], llm: ChatLLM,
                   critic: dict[str, Any], cache: dict[str, dict[str, Any]],
                   on_record: Callable[[dict[str, Any]], None] | None = None,
-                  ) -> tuple[dict[tuple[str, str], dict[str, Any]], int]:
+                  prompt_path: Path = CRITIC_PROMPT_PATH) -> tuple[dict[tuple[str, str], dict[str, Any]], int]:
     """Ask the critic to score each pair, in both calls; return its records by (pair id, call),
     from `cache` (records by key) or asked now, and the number of API errors.
 
@@ -283,7 +296,7 @@ def critic_scores(pairs: list[QAPair], docs: dict[tuple[str, str], "CanonicalDoc
     todo: dict[tuple[str, tuple[str, ...]], list[tuple[QAPair, list[dict[str, str]], str]]] = defaultdict(list)
     for qa in pairs:
         for call in CALL_CRITERIA:
-            messages = build_critic_messages(docs[(qa.corpus, qa.doc_id)], qa, call)
+            messages = build_critic_messages(docs[(qa.corpus, qa.doc_id)], qa, call, prompt_path)
             key = critic_key(messages, critic_json_schema(call, qa.kind), critic)
             if key in cache:
                 records[(qa.id, call)] = cache[key]
@@ -334,6 +347,56 @@ def embed_questions(questions: list[str], cfg: Config, secrets: Secrets) -> np.n
     check_gpu_free(secrets)
     with Embedder(load_specs(cfg)[cfg.embedding.primary]) as embedder:
         return embedder.encode_documents(questions, cfg.embedding.batch_size)
+
+
+def dedup_cache_path(cfg: Config, corpus: str) -> Path:
+    """data/embeddings/dedup/<primary embedder>/<corpus>.npy; its metadata is the .json next to it."""
+    return cfg.embedding_cache_dir / "dedup" / cfg.embedding.primary / f"{corpus}.npy"
+
+
+def question_key(question: str) -> str:
+    return hashlib.sha256(question.encode("utf-8")).hexdigest()
+
+
+def load_dedup_cache(cfg: Config, corpus: str, settings: dict[str, Any]) -> dict[str, np.ndarray]:
+    """question_key -> vector of every question of `corpus` encoded so far with `settings` (the
+    primary embedder's); empty without a cache or when it was made with other settings."""
+    path = dedup_cache_path(cfg, corpus)
+    meta_path = path.with_suffix(".json")
+    if not (path.exists() and meta_path.exists()):
+        return {}
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if meta.get("settings") != settings:
+        return {}
+    return dict(zip(meta["keys"], np.load(path)))
+
+
+def save_dedup_cache(cfg: Config, corpus: str, settings: dict[str, Any], vectors: dict[str, np.ndarray]) -> None:
+    path = dedup_cache_path(cfg, corpus)
+    meta_path = path.with_suffix(".json")
+    meta_path.unlink(missing_ok=True)            # written last: only ever next to its complete matrix
+    save_npy(path, np.stack(list(vectors.values())))
+    write_json(meta_path, {"embedder": cfg.embedding.primary, "corpus": corpus, "settings": settings,
+                           "n": len(vectors), "created": datetime.now().isoformat(timespec="seconds"),
+                           "keys": list(vectors)})
+
+
+def dedup_vectors(pairs: list[QAPair], cfg: Config, secrets: Secrets) -> np.ndarray:
+    """The questions of `pairs` as unit-norm vectors (row i = pairs[i]), cached per corpus by question
+    text: only the questions no run has encoded yet go to `embed_questions` (GPU). Why: fp16 batches
+    pad differently with other questions in them, which moves a cosine in its last digits, so without
+    the cache a re-run or another corpus could flip a pair sitting at the threshold."""
+    settings = load_specs(cfg)[cfg.embedding.primary].settings
+    known = {corpus: load_dedup_cache(cfg, corpus, settings) for corpus in dict.fromkeys(qa.corpus for qa in pairs)}
+    todo = list(dict.fromkeys((qa.corpus, qa.question) for qa in pairs if question_key(qa.question) not in known[qa.corpus]))
+    cached = sum(question_key(qa.question) in known[qa.corpus] for qa in pairs)
+    log.info("dedup: %d of %d question vectors cached, %d to encode", cached, len(pairs), len(todo))
+    if todo:
+        for (corpus, question), vector in zip(todo, embed_questions([q for _, q in todo], cfg, secrets)):
+            known[corpus][question_key(question)] = vector
+        for corpus in dict.fromkeys(corpus for corpus, _ in todo):
+            save_dedup_cache(cfg, corpus, settings, known[corpus])
+    return np.stack([known[qa.corpus][question_key(qa.question)] for qa in pairs])
 
 
 def deduplicate(pairs: list[QAPair], vectors: np.ndarray, threshold: float,
@@ -443,7 +506,45 @@ def filter_paths(cfg: Config) -> dict[str, Path]:
     """The files this stage writes in data/qa."""
     qa_dir = cfg.paths.data_dir / "qa"
     return {"filtered": qa_dir / "filtered.jsonl", "rejected": qa_dir / "rejected.jsonl",
-            "critic": qa_dir / "critic_scores.jsonl"}
+            "critic": qa_dir / "critic_scores.jsonl", "provenance": qa_dir / "filtered.provenance.json"}
+
+
+def filter_settings(cfg: Config, critic: dict[str, Any]) -> dict[str, Any]:
+    """What decides which of a corpus's pairs are kept: the critic (`critic`: model, settings, Ollama
+    digest, seed, CRITIC_VERSION) and its prompt, the threshold, and the de-duplication's embedder
+    and cosine. Recorded per corpus, since `--corpus` can filter corpora at different times."""
+    spec = load_specs(cfg)[cfg.embedding.primary]
+    return {"critic": critic, "critic_prompt_sha256": hashlib.sha256(cfg.prompts.qa_critic.read_bytes()).hexdigest(),
+            "critic_min_score": cfg.qa.critic_min_score, "dedup_embedder": {"name": spec.name, **spec.settings},
+            "dedup_cosine_threshold": cfg.qa.dedup_cosine_threshold}
+
+
+def read_filter_provenance(cfg: Config) -> dict[str, dict[str, Any]]:
+    """The filter settings by corpus (`filter_settings`); a corpus filtered before they were recorded
+    (2026-10-28) is missing."""
+    path = filter_paths(cfg)["provenance"]
+    return json.loads(path.read_text(encoding="utf-8"))["settings_by_corpus"] if path.exists() else {}
+
+
+def carry_over(paths: dict[str, Path], raw: list[QAPair], corpora: list[str]) -> tuple[list[QAPair], list[QAPair]]:
+    """The kept and the rejected pairs of every corpus outside `corpora`, as the last run wrote them.
+    Warns for such a corpus whose pairs in raw.jsonl aren't the ones filtered: gen-qa ran for it since."""
+    def outside(path: Path) -> list[QAPair]:
+        return [qa for qa in load_pairs(path) if qa.corpus not in corpora] if path.exists() else []
+
+    kept, rejected = outside(paths["filtered"]), outside(paths["rejected"])
+    raw_ids, filtered_ids = defaultdict(set), defaultdict(set)
+    for qa in raw:
+        if qa.corpus not in corpora:
+            raw_ids[qa.corpus].add(qa.id)
+    for qa in kept + rejected:
+        filtered_ids[qa.corpus].add(qa.id)
+    for corpus in sorted(raw_ids.keys() | filtered_ids.keys()):
+        new, gone = raw_ids[corpus] - filtered_ids[corpus], filtered_ids[corpus] - raw_ids[corpus]
+        if new or gone:
+            log.warning("%s: carried over as filtered last time, but raw.jsonl has %d pair(s) not filtered and lacks "
+                        "%d filtered one(s): run `chunkeval filter-qa --corpus %s`", corpus, len(new), len(gone), corpus)
+    return kept, rejected
 
 
 def load_docs(cfg: Config, pairs: list[QAPair], provenance_path: Path) -> dict[tuple[str, str], "CanonicalDoc"]:
@@ -471,22 +572,29 @@ def _preference(qa: QAPair) -> tuple[bool, int, tuple[str, str, int]]:
     return qa.kind != "two_span", -sum(critic[name]["score"] for name in CRITERIA if name in critic), _doc_order(qa)
 
 
-def run(cfg: Config, secrets: Secrets) -> None:
-    """CLI entry (`chunkeval filter-qa`): raw.jsonl → checks → critic → decide → dedup →
-    filtered.jsonl + rejected.jsonl, both in document order.
+def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
+    """CLI entry (`chunkeval filter-qa`): the pairs of `corpora` in raw.jsonl → checks → critic →
+    decide → dedup → filtered.jsonl + rejected.jsonl, both in document order. Every other corpus's
+    lines in both files are carried over as they are (`carry_over`).
 
     Every pair that passes is kept (no final down-sampling). The critic is asked only about pairs
     that passed the checks, and only when its answer isn't cached (see the module docstring); then
-    it is unloaded, because bge-m3 needs the GPU for the de-duplication. Pairs without an answer
-    (API errors) stop the stage before anything is written: a re-run asks exactly those.
-    Ends with `summarize` (logged and written to runs/<run_id>/filter_qa_summary.json) and, the
-    first time, a sample for hand labelling (runs/<run_id>/filter_qa_labelling.csv).
+    it is unloaded, because bge-m3 needs the GPU for the questions the de-duplication hasn't encoded
+    yet. Pairs without an answer (API errors) stop the stage before anything is written: a re-run
+    asks exactly those. Ends with the filter settings of `corpora` (filtered.provenance.json),
+    `summarize` (logged and written to runs/<run_id>/filter_qa_summary.json) and, the first time, a
+    sample of this run's pairs for hand labelling (runs/<run_id>/filter_qa_labelling.csv).
     The CLI already ran `check_ollama` before this and unloads the critic afterwards.
     """
     gen, paths = qa_paths(cfg), filter_paths(cfg)
     if not gen["raw"].exists():
         raise FileNotFoundError(f"{gen['raw']} not found: run `chunkeval gen-qa` first")
-    pairs = sorted(load_pairs(gen["raw"]), key=_doc_order)
+    raw = load_pairs(gen["raw"])
+    pairs = sorted((qa for qa in raw if qa.corpus in corpora), key=_doc_order)
+    for corpus in corpora:
+        if not any(qa.corpus == corpus for qa in pairs):
+            log.warning("%s: no pairs in %s, nothing to filter", corpus, gen["raw"])
+    carried_kept, carried_rejected = carry_over(paths, raw, corpora)
     docs = load_docs(cfg, pairs, gen["provenance"])
     rejected: list[QAPair] = []
 
@@ -510,7 +618,8 @@ def run(cfg: Config, secrets: Secrets) -> None:
               "digest": ollama_model_digest(llm.base_url, llm.model) if llm.provider == "ollama" else None}
     cache = {r["key"]: r for r in read_jsonl(paths["critic"])} if paths["critic"].exists() else {}
     records, api_errors = critic_scores(candidates, docs, llm, critic, cache,
-                                        on_record=lambda record: append_jsonl(paths["critic"], record))
+                                        on_record=lambda record: append_jsonl(paths["critic"], record),
+                                        prompt_path=cfg.prompts.qa_critic)
     if llm.provider == "ollama":
         unload_ollama_model(llm.base_url, llm.model)
     if api_errors:
@@ -535,7 +644,7 @@ def run(cfg: Config, secrets: Secrets) -> None:
 
     # 4. De-duplication.
     passed.sort(key=_preference)
-    vectors = (embed_questions([qa.question for qa in passed], cfg, secrets) if len(passed) > 1
+    vectors = (dedup_vectors(passed, cfg, secrets) if len(passed) > 1
                else np.ones((len(passed), 1), dtype=np.float32))
     kept, removed = deduplicate(passed, vectors, cfg.qa.dedup_cosine_threshold)
     for qa, duplicate_of, cosine in removed:
@@ -543,16 +652,22 @@ def run(cfg: Config, secrets: Secrets) -> None:
                duplicate_of=duplicate_of, cosine=cosine)
     log.info("dedup: %d near-duplicate(s) removed (cosine > %s)", len(removed), cfg.qa.dedup_cosine_threshold)
 
-    kept.sort(key=_doc_order)
+    kept.sort(key=_doc_order)                   # the labelling sample draws from this order
     rejected.sort(key=_doc_order)
-    write_jsonl(paths["filtered"], kept)
-    write_jsonl(paths["rejected"], rejected)
+    write_jsonl(paths["filtered"], sorted(carried_kept + kept, key=_doc_order))
+    write_jsonl(paths["rejected"], sorted(carried_rejected + rejected, key=_doc_order))
+    by_corpus = read_filter_provenance(cfg)
+    for corpus in corpora:
+        by_corpus.pop(corpus, None)
+    by_corpus |= {corpus: filter_settings(cfg, critic) for corpus in dict.fromkeys(qa.corpus for qa in pairs)}
+    write_json(paths["provenance"], {"settings_by_corpus": by_corpus})
 
-    summary = summarize(kept, rejected, cfg)
+    summary = summarize(carried_kept + kept, carried_rejected + rejected, cfg)
     for corpus, s in summary.items():
-        log.info("%s: %d pairs -> %d kept (%.0f%%); rejected by stage %s; reasons %s; kept by type %s, by kind %s",
-                 corpus, s["pairs"], s["kept"], 100 * s["keep_rate"], s["rejected"], s["reasons"],
-                 s["kept_types"], s["kept_kinds"])
+        if corpus in corpora:
+            log.info("%s: %d pairs -> %d kept (%.0f%%); rejected by stage %s; reasons %s; kept by type %s, by kind %s",
+                     corpus, s["pairs"], s["kept"], 100 * s["keep_rate"], s["rejected"], s["reasons"],
+                     s["kept_types"], s["kept_kinds"])
     write_json(run_dir(cfg) / "filter_qa_summary.json", summary)
     labelling = run_dir(cfg) / "filter_qa_labelling.csv"
     n = export_for_labelling(kept, rejected, docs, LABELLING_SIZE, labelling, np.random.default_rng(cfg.seed))

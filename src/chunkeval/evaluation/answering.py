@@ -33,16 +33,17 @@ ABSTENTION_PHRASE; when the passages hold part of it, for that part, with nothin
 Re-runs: the generator's answers are cached in answer_cache.jsonl, keyed by a hash of everything
 that decides them (`answer_key`: the messages with their titles, the generator's model, settings and
 Ollama digest, the seed, ANSWER_VERSION). A re-run asks only what is new: new questions, a question shown other
-chunks, or everything after a prompt or generator change. The answer files are rewritten from the
-cache every time, so they always match the current questions and retrieval.
+chunks, or everything after a prompt or generator change. The cache is shared by every run_id and
+data dir (paths.llm_cache_dir): a new run asks only the requests no run has made. The answer files
+are rewritten from the cache every time, so they always match the current questions and retrieval.
 
 Reads:  data/qa/filtered.jsonl (+ raw.provenance.json), data/parsed/, data/chunks/,
         runs/<run_id>/retrieval/<primary embedder>/*.jsonl (up to date: `chunkeval retrieve`)
 Writes: runs/<run_id>/answers/<corpus>_<setup>.jsonl   one `Answer` per question, in question order;
             <setup> is "<method>_<ovl>" or "gold_passage"; a .provenance.json next to each
-        runs/<run_id>/answer_cache.jsonl   the generator's answers (append-only cache, see above)
+        data/llm_cache/answer_cache.jsonl   the generator's answers (append-only cache, see above)
         runs/<run_id>/answer_summary.json
-Prompt: prompts/rag_answer.md
+Prompt: prompts.rag_answer (prompts/rag_answer.md)
 """
 from __future__ import annotations
 
@@ -82,6 +83,7 @@ GOLD_PASSAGE = "gold_passage"
 # (rule 7 of prompts/rag_answer.md; `load_prompt` checks the two agree).
 ABSTENTION_PHRASE = "The context does not contain the answer."
 
+# The shipped prompt, the default of `load_prompt`; the stage reads cfg.prompts.rag_answer.
 PROMPT_PATH = REPO_ROOT / "prompts" / "rag_answer.md"
 # The sections of the prompt file and the placeholders each must use ("system" is sent as is).
 PROMPT_SECTIONS: dict[str, set[str] | None] = {
@@ -139,13 +141,14 @@ def load_prompt(path: Path = PROMPT_PATH) -> dict[str, str]:
     return sections
 
 
-def build_messages(question: str, passages: list[tuple[str, str]]) -> list[dict[str, str]]:
-    """System + user chat messages for one question, from prompts/rag_answer.md.
+def build_messages(question: str, passages: list[tuple[str, str]],
+                   prompt_path: Path = PROMPT_PATH) -> list[dict[str, str]]:
+    """System + user chat messages for one question, from the prompt file (cfg.prompts.rag_answer).
 
     The system message holds every rule, so it is the same for every call; the user message holds
     the passages, (title, text) pairs numbered in the order given (rank order), then the question.
     """
-    prompt = load_prompt()
+    prompt = load_prompt(prompt_path)
     context = "\n\n".join(Template(prompt["passage"]).substitute(number=i, title=title, text=text)
                           for i, (title, text) in enumerate(passages, start=1))
     user = Template(prompt["user"]).substitute(context=context, question=question)
@@ -304,8 +307,13 @@ def answer_path(cfg: Config, corpus: str, setup: str) -> Path:
 
 
 def answer_cache_path(cfg: Config) -> Path:
-    """runs/<run_id>/answer_cache.jsonl, outside answers/ so that folder holds answer files only."""
-    return cfg.paths.runs_dir / cfg.run_id / "answer_cache.jsonl"
+    """<paths.llm_cache_dir>/answer_cache.jsonl: one cache for every run_id and data dir."""
+    return cfg.paths.llm_cache_dir / "answer_cache.jsonl"
+
+
+def prompt_sha256(cfg: Config) -> str:
+    """The answer prompt's hash, recorded with every answer file (and checked by `eval`)."""
+    return hashlib.sha256(cfg.prompts.rag_answer.read_bytes()).hexdigest()
 
 
 def write_answers(path: Path, answers: list[Answer], provenance: dict[str, Any]) -> None:
@@ -396,7 +404,7 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
     todo: dict[str, tuple[str, str, list[dict[str, str]]]] = {}
     for (corpus, setup), (shown, _) in setups.items():
         for qa in questions[corpus]:
-            messages = build_messages(qa.question, shown[qa.id].passages)
+            messages = build_messages(qa.question, shown[qa.id].passages, cfg.prompts.rag_answer)
             key = keys[(corpus, setup, qa.id)] = answer_key(messages, generator)
             if key not in cache and key not in todo:
                 todo[key] = (qa.id, setup, messages)
@@ -422,7 +430,7 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str]) -> None:
                                model=r["model"], prompt_tokens=r["prompt_tokens"],
                                completion_tokens=r["completion_tokens"]))
         write_answers(answer_path(cfg, corpus, setup), rows, {**provenance, "generator": generator,
-                      "prompt_sha256": hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest()})
+                      "prompt_sha256": prompt_sha256(cfg)})
         answers += rows
 
     summary = summarize(answers)

@@ -248,7 +248,7 @@ def variants(cfg: Config) -> list[str]:
 
 def cache_path(cfg: Config, embedder: str, corpus: str, variant: str) -> Path:
     """data/embeddings/<embedder>/<corpus>/<variant>.npy; its metadata is the .json next to it."""
-    return cfg.embedding.cache_dir / embedder / corpus / f"{variant}.npy"
+    return cfg.embedding_cache_dir / embedder / corpus / f"{variant}.npy"
 
 
 def _sha256(path: Path) -> str:

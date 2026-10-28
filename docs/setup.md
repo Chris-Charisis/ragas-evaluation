@@ -151,7 +151,7 @@ docker compose down -v                                 # stop and DELETE all col
 - **The database is disposable.** Chunks and cached embeddings live in `data/`, so `chunkeval index` rebuilds every collection. You don't need Weaviate backups. Use `down -v` to start clean.
 - **Memory:** `GOMEMLIMIT=6GiB` is a soft cap. The full corpus's 12 collections hold 84,447 objects with two 1024-dim vectors each, about 0.7 GB of vectors. Raise it if you run the chunk-size sweep.
 
-**Collection names:** `{corpus}_{method}_{overlap}_v2` (see `configs/default.yaml`). Weaviate capitalises the first letter, so `papers_sentence_overlap_v2` is stored as `Papers_sentence_overlap_v2`. `config.collection_name` returns names in that form, so lookups match.
+**Collection names:** `{namespace}{corpus}_{method}_{overlap}_v2` (see `configs/default.yaml`). The namespace is empty for `data/`, and for another data dir its name (`data/size512` gives `size512_papers_sentence_overlap_v2`), so two data dirs never share a collection. Weaviate capitalises the first letter, so `papers_sentence_overlap_v2` is stored as `Papers_sentence_overlap_v2`. `config.collection_name` returns names in that form, so lookups match.
 
 **Problems:**
 

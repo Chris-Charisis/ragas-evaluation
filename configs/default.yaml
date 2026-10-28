@@ -1,13 +1,19 @@
 # Single source of truth for a run. Every stage reads this file (via chunkeval.core.config).
 # Rule of thumb: anything you might change between experiments belongs here, not in code.
-# TODO(you): replace the placeholder values; keep secrets OUT of this file (they live in .env).
+# Another experiment: a config that starts with `extends: default.yaml` and holds only what differs,
+# passed with --config (see docs/development.md#configs-for-other-experiments).
 
 run_id: "full_data-v1.0"            # artefacts go to runs/<run_id>/ — bump it for every new experiment
 seed: 42                      # used for sampling docs/units/questions, the bootstrap and the LLM `seed` parameter
 
 paths:
+  # Parsed docs, chunks, vectors (embedding.cache_dir) and the question set. Another data dir gets
+  # its own Weaviate collections too (weaviate.collection_template).
   data_dir: "data"
   runs_dir: "runs"
+  # The answer and judge caches, shared by every run_id and data dir: keyed by everything that
+  # decides a call, so a new run never pays the judge again for a call already made.
+  llm_cache_dir: "data/llm_cache"
   # Docling needs the ORIGINAL PDFs, not the extracted_text JSONs.
   corpora:
     papers: "data/corpora/papers"
@@ -25,9 +31,7 @@ parsing:
   #   "flat":      every heading is level 1, so sections never nest
   heading_levels: "font_size"
   # A PDF whose text layer exceeds either ratio is converted again with full-page OCR (see
-  # parsing.text_layer_problems). Set on the first 4 PDFs: recalibrate on the whole corpus, every
-  # parsed JSON keeps its ratios in meta.text_layer.auto. Changing them re-parses only the PDFs
-  # whose OCR decision flips.
+  # parsing.text_layer_problems).
   ocr_max_replacement_char_ratio: 0.01     # share of "�" (fonts without Unicode map); report_16: 0.71
   ocr_max_repeated_paragraph_ratio: 0.05   # duplicated hidden text layer; paper_4: 0.12, report_15: 0.007
   # Title lists below match the whole heading, case, numbering and punctuation ignored, plus one
@@ -87,15 +91,13 @@ embedding:
   primary: "bge_m3"                  # main grid: span metrics + RAG answers + Ragas
   secondary: ["qwen3_06b"]           # robustness check: span metrics only
   batch_size: 32
-  cache_dir: "data/embeddings"
+  # cache_dir: not set, so <paths.data_dir>/embeddings: each data dir keeps its own vectors.
   # `name` doubles as the Weaviate named-vector name (letters, digits, underscores only).
   # Both models output 1024-dim normalised vectors (cosine) — dimension checks can't tell them apart.
   # `revision`: the Hub commit to load (full 40-char hash; a branch like "main" is rejected). Without
   # it every load takes the latest commit, so an upstream push could change the vectors mid-experiment,
   # e.g. queries embedded by a newer model than the documents they are searched against.
   # Changing it makes `chunkeval embed` re-embed every chunk file of that model.
-  # To update: pick a commit on the model page (Files and versions -> History), or print the latest with
-  #   uv run python -c "from huggingface_hub import HfApi; print(HfApi().model_info('BAAI/bge-m3').sha)"
   models:
     bge_m3:
       model_id: "BAAI/bge-m3"        # 8192-token context, CLS pooling, dense output used here
@@ -140,7 +142,7 @@ chunking:
   # Not tuned either: size_sweep is the way to test other sizes.
   target_tokens: 256
   max_tokens: 512                    # experimental cap (no longer a model limit: bge-m3 reads 8192)
-  overlap_ratio: 0.12                # 10–15% recommended by the docx; sentence methods round to whole sentences
+  overlap_ratio: 0.12                # 10–15% recommended; sentence methods round to whole sentences
   min_section_tokens: 40             # recursive: merge smaller sibling sections (within the same parent)
   # Keys, used in file names, chunk ids and collections. The report and the docs call character
   # "fixed-size" and recursive "section" (analysis/inputs.py, docs/corpus.md#chunk-chunk).
@@ -155,7 +157,9 @@ weaviate:
   host: "localhost"
   port: 8080
   grpc_port: 50051
-  collection_template: "{corpus}_{method}_{overlap}_v2"   # never overwrite the old collections
+  # "_v2": never overwrite the old collections. {namespace} is "" for data/ and "<name>_" for any
+  # other data dir (data/size512 -> "size512_"), or weaviate.namespace when set.
+  collection_template: "{namespace}{corpus}_{method}_{overlap}_v2"
 
 ollama:
   # Expected SERVER settings (set in `sudo systemctl edit ollama`, see llm.py) — checked by llm.check_ollama.
@@ -192,10 +196,14 @@ llm:
   # uses no reasoning tokens). No dated snapshot: OpenAI can update it behind the name, and its responses
   # carry no fingerprint to notice it by; every call is cached, so a finished run stays as it was.
   # Its price is in ragas.prices.
-  # No second judge: a gpt-4o "bridge" run to compare with the previous round was dropped (2026-10-11).
   judge:         {provider: "openai", model: "gpt-6-luna", temperature: 0.0, reasoning_effort: "none"}
-  # Re-check https://developers.openai.com/api/docs/deprecations before the eval run
-  # (2026-10-21: no shutdown date announced for gpt-6-luna).
+
+# The prompt files, relative to the repo root. Their text is what the provenance records and cache
+# keys hold, not the path: a copy with the same text elsewhere changes nothing.
+prompts:
+  qa_generation: "prompts/qa_generation.md"
+  qa_critic: "prompts/qa_critic.md"
+  rag_answer: "prompts/rag_answer.md"
 
 qa:
   docs_per_corpus: 150

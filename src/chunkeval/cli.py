@@ -59,7 +59,7 @@ STAGES: dict[str, Stage] = {
     "gen-qa": Stage("Stage 4: generate Q-A pairs with located evidence spans",
                     ("chunkeval.qa.generation:run",), ("corpora", "limit", "recreate")),
     "filter-qa": Stage("Stage 5: deterministic checks + critic + dedup + final sample",
-                       ("chunkeval.qa.filtering:run",)),
+                       ("chunkeval.qa.filtering:run",), ("corpora",)),
     "retrieve": Stage("Stage 6: top-k retrieval per question, collection and embedder + span metrics",
                       ("chunkeval.evaluation.retrieval:run", "chunkeval.evaluation.retrieval_metrics:run"),
                       ("corpora", "embedders")),
@@ -94,7 +94,8 @@ OPTIONS: dict[str, Callable[[argparse.ArgumentParser], Any]] = {
     "recreate": lambda p: p.add_argument(
         "--recreate", action="store_true",
         help="delete what this stage built before and build it again; default: reuse what is up to "
-             "date, refuse what is stale (index: the selected collections; gen-qa: all Q-A records)"),
+             "date, refuse what is stale (index: the selected collections; gen-qa: the Q-A records of "
+             "the selected corpora)"),
     "pilot": lambda p: p.add_argument(
         "--pilot", type=_positive_int, metavar="N",
         help="only the first N questions of each corpus's Ragas sample, to measure the cost per question; "

@@ -14,12 +14,15 @@ import pytest
 
 from chunkeval import analysis
 from chunkeval.analysis import plots, views
+from chunkeval.analysis import report as report_module
 from chunkeval.analysis.inputs import METHOD_LABELS, label, load_inputs
 from chunkeval.analysis.stats import (bootstrap_ci, detectable_difference, holm, paired_diff, paired_family, rng_for,
                                       verdict)
 from chunkeval.core.config import Secrets, load_config
-from chunkeval.core.store import run_dir
+from chunkeval.core.store import run_dir, write_json
 from chunkeval.evaluation.answering import GOLD_PASSAGE
+from chunkeval.qa.filtering import filter_paths
+from chunkeval.qa.generation import qa_paths
 from test_answering import answers  # noqa: F401  (fixtures used below)
 from test_ragas_eval import evaluate, evaluated  # noqa: F401
 from test_retrieval import VARIANT, offline, score, stage  # noqa: F401
@@ -202,6 +205,30 @@ def test_without_a_ragas_table_the_report_covers_retrieval(reported):
     text = (out / "report.md").read_text(encoding="utf-8")
     assert "No Ragas table yet" in text and "### 3.1" in text
     assert not (out / "tables" / "generation_means.csv").exists()
+
+
+def test_question_settings_name_what_differs_between_corpora(cfg, tmp_path):
+    """Each corpus's gen-qa and filter-qa settings, and the keys that differ between corpora; a corpus
+    filtered before the settings were recorded has none and differs in nothing."""
+    cfg.paths.data_dir = tmp_path / "data"
+    gen = {"generator": {"model": "g", "digest": "sha256:abc"}, "prompt_sha256": "p" * 64, "seed": 42}
+    write_json(qa_paths(cfg)["provenance"], {"settings_by_corpus": {"papers": gen, "reports": {**gen, "seed": 7}},
+                                             "docs": {}})
+    filt = {"critic": {"model": "c", "digest": None}, "critic_prompt_sha256": "q" * 64, "critic_min_score": 4,
+            "dedup_embedder": {}, "dedup_cosine_threshold": 0.92}
+    write_json(filter_paths(cfg)["provenance"], {"settings_by_corpus": {"papers": filt}})
+    made = report_module.question_settings(cfg, ["papers", "reports"])
+    assert made["differ"] == {"gen-qa": ["seed"], "filter-qa": []}
+    assert made["by_corpus"]["papers"]["generation"]["digest"] == "sha256:abc" and made["by_corpus"]["reports"]["filter"] is None
+
+
+def test_report_warns_when_corpora_were_made_differently(reported, monkeypatch):
+    made = {"by_corpus": {"papers": {"generation": None, "filter": None}},
+            "differ": {"gen-qa": ["generator", "seed"], "filter-qa": []}}
+    monkeypatch.setattr(report_module, "question_settings", lambda cfg, corpora: made)
+    text = (report(reported) / "report.md").read_text(encoding="utf-8")
+    assert "questions were made with different settings** (gen-qa: generator, seed; see the run record)" in text
+    assert "gen-qa not recorded; filter-qa not recorded" in text
 
 
 def test_stale_tables_are_refused(reported):

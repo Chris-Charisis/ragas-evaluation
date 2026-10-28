@@ -9,7 +9,9 @@ from pydantic import ValidationError
 
 from chunkeval.core.config import (Secrets, collection_name, load_config, load_secrets,
                               require_secrets, save_config)
-from chunkeval.core.schema import Config
+from chunkeval.core.schema import REPO_ROOT, Config, workspace_namespace
+
+from conftest import DEFAULT_CONFIG
 
 
 # --------------------------------------------------------------------------------------
@@ -26,8 +28,68 @@ def test_relative_path_works_from_any_cwd(tmp_path, monkeypatch):
 
 
 def test_paths_are_absolute(cfg):
-    paths = [cfg.paths.data_dir, cfg.embedding.cache_dir, *cfg.paths.corpora.values()]
+    p = cfg.prompts
+    paths = [cfg.paths.data_dir, cfg.paths.llm_cache_dir, cfg.embedding_cache_dir, *cfg.paths.corpora.values(),
+             p.qa_generation, p.qa_critic, p.rag_answer]
     assert all(p.is_absolute() for p in paths)
+
+
+# --------------------------------------------------------------------------------------
+# extends: a config holding only what differs
+# --------------------------------------------------------------------------------------
+
+def write_yaml(path, data):
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def test_extends_merges_on_top_of_its_base(tmp_path):
+    """Mappings merge key by key, lists and values replace, null removes the key (its default then
+    applies), and the base is found relative to the extending file; chains work."""
+    write_yaml(tmp_path / "base.yaml", {"extends": str(DEFAULT_CONFIG), "run_id": "base-run"})
+    child = write_yaml(tmp_path / "child.yaml", {
+        "extends": "base.yaml",
+        "paths": {"data_dir": "data/size512", "corpora": {"reports": None}},
+        "parsing": {"body": {"reports": None}, "title_overrides": None},
+        "chunking": {"target_tokens": 512, "overlap": [True]},
+        "analysis": {"baseline": "character_overlap"}})
+    default, cfg = load_config(DEFAULT_CONFIG), load_config(child)
+    assert cfg.run_id == "base-run"
+    assert cfg.paths.data_dir == REPO_ROOT / "data" / "size512" and cfg.paths.runs_dir == default.paths.runs_dir
+    assert list(cfg.paths.corpora) == ["papers"] and list(cfg.parsing.body) == ["papers"]
+    assert cfg.parsing.title_overrides is None and cfg.parsing.skip_section_titles == default.parsing.skip_section_titles
+    assert (cfg.chunking.target_tokens, cfg.chunking.overlap, cfg.chunking.methods) == (512, [True], default.chunking.methods)
+
+
+def test_extends_refuses_a_cycle(tmp_path):
+    write_yaml(tmp_path / "a.yaml", {"extends": "b.yaml"})
+    write_yaml(tmp_path / "b.yaml", {"extends": "a.yaml"})
+    with pytest.raises(ValueError, match="extends itself"):
+        load_config(tmp_path / "a.yaml")
+
+
+def test_another_data_dir_gets_its_own_vectors_and_collections(tmp_path):
+    """Another data dir caches its own vectors and names its own collections, so `embed` and
+    `index --recreate` there never touch data/'s; weaviate.namespace: "" shares them on purpose."""
+    default = load_config(DEFAULT_CONFIG)
+    assert default.collection_namespace == "" and default.embedding_cache_dir == REPO_ROOT / "data" / "embeddings"
+    assert default.paths.llm_cache_dir == REPO_ROOT / "data" / "llm_cache"
+
+    cfg = load_config(write_yaml(tmp_path / "x.yaml", {"extends": str(DEFAULT_CONFIG), "paths": {"data_dir": "data/size512"}}))
+    assert cfg.embedding_cache_dir == REPO_ROOT / "data" / "size512" / "embeddings"
+    assert collection_name(cfg, "papers", "sentence", True) == "Size512_papers_sentence_overlap_v2"
+    assert cfg.paths.llm_cache_dir == default.paths.llm_cache_dir            # the LLM caches stay shared
+    shared = load_config(write_yaml(tmp_path / "y.yaml", {"extends": "x.yaml", "weaviate": {"namespace": ""}}))
+    assert collection_name(shared, "papers", "sentence", True) == "Papers_sentence_overlap_v2"
+
+    default.paths.data_dir = tmp_path / "data"                               # set after loading, as tests do
+    assert default.embedding_cache_dir == tmp_path / "data" / "embeddings"
+
+
+@pytest.mark.parametrize("data_dir, namespace", [
+    ("data", ""), ("data/size512", "size512"), ("data/a/b-c", "a_b_c"), ("other", "other")])
+def test_workspace_namespace(data_dir, namespace):
+    assert workspace_namespace(REPO_ROOT / data_dir) == namespace
 
 
 def test_reasoning_effort_parsed(cfg):
@@ -70,6 +132,14 @@ INVALID_CONFIGS = {
     "body rule for unknown corpus": (lambda r: r["parsing"]["body"].update(thesis={}), "thesis"),
     "unknown body rule key": (lambda r: r["parsing"]["body"]["papers"].update(stop_titles=[]), "stop_titles"),
     "template missing placeholder": (_set("weaviate", collection_template="{corpus}_{method}_v2"), "placeholders"),
+    "unknown template placeholder": (_set("weaviate", collection_template="{run}{corpus}_{method}_{overlap}"),
+                                     "placeholders"),
+    "no namespace for another data dir": (lambda r: (r["paths"].update(data_dir="data/size512"), r["weaviate"].update(
+        collection_template="{corpus}_{method}_{overlap}_v2")), "no {namespace}"),
+    "bad namespace": (_set("weaviate", namespace="2026_run"), "namespace"),
+    "data dir without a valid namespace": (_set("paths", data_dir="data/2026"), "set weaviate.namespace"),
+    "prompt file missing": (_set("prompts", qa_critic="prompts/nope.md"), "no such file"),
+    "missing prompts section": (lambda r: r.pop("prompts"), "prompts"),
     "bad vector name": (lambda r: r["embedding"]["models"].update(
         {"bge-m3": r["embedding"]["models"]["bge_m3"]}), "bge-m3"),
     "primary also secondary": (_set("embedding", secondary=["qwen3_06b", "bge_m3"]), "listed twice"),

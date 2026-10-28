@@ -108,11 +108,13 @@ def raw_config() -> dict:
 
 @pytest.fixture
 def cfg(tmp_path):
-    """The validated default config, with runs_dir redirected to a temp dir.
+    """The validated default config, with runs_dir and the shared LLM caches redirected to a temp dir.
 
     Fresh per test (tests may mutate it), and nothing a test writes via `run_dir` /
-    `save_config` / `check_ollama` ends up in the real runs/ folder.
+    `save_config` / `check_ollama` ends up in the real runs/ folder, nor any answer or judge call
+    in the real data/llm_cache/.
     """
     config = load_config(DEFAULT_CONFIG)
     config.paths.runs_dir = tmp_path / "runs"
+    config.paths.llm_cache_dir = tmp_path / "llm_cache"
     return config

@@ -16,9 +16,9 @@ Why this design (revisits "idea 2" — the rationale of the ground-truth context
 
 Reads:  data/parsed/<corpus>/*.json
 Writes: data/qa/raw.jsonl (one QAPair per line), data/qa/gen_dropped.jsonl (one DroppedUnit per
-        line), data/qa/raw.provenance.json (what both were made with; resume is refused when it
-        differs), runs/<run_id>/gen_qa_summary.json
-Prompt: prompts/qa_generation.md
+        line), data/qa/raw.provenance.json (what each corpus's records were made with; resume is
+        refused when it differs), runs/<run_id>/gen_qa_summary.json
+Prompt: prompts.qa_generation (prompts/qa_generation.md)
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ from chunkeval.core.config import Secrets
 from chunkeval.core.llm import ChatLLM, LLMOutputError, LLMResult, ollama_model_digest
 from chunkeval.core.prompts import load_sections
 from chunkeval.core.schema import REPO_ROOT, Config, QuestionType
-from chunkeval.core.store import append_jsonl, done_ids, read_jsonl, run_dir, write_json
+from chunkeval.core.store import append_jsonl, done_ids, read_jsonl, run_dir, write_json, write_jsonl
 from chunkeval.corpus.chunking.base import load_counter, pack
 from chunkeval.corpus.chunking.sentence import block_sentences
 from chunkeval.corpus.parsing import is_skippable_section, load_doc
@@ -150,6 +150,7 @@ QA_JSON_SCHEMA: dict[str, Any] = {
     ],
 }
 
+# The shipped prompt, the default of `load_prompt`; the stage reads cfg.prompts.qa_generation.
 PROMPT_PATH = REPO_ROOT / "prompts" / "qa_generation.md"
 # The sections of the prompt file and the placeholders each must use ("system" is sent as is).
 PROMPT_SECTIONS: dict[str, set[str] | None] = {
@@ -302,8 +303,9 @@ def render_passages(doc: "CanonicalDoc", spans: list[tuple[int, int]], template:
         for label, (start, end) in zip(labels, spans))
 
 
-def build_messages(doc: "CanonicalDoc", unit: GenerationUnit, question_type: str) -> list[dict[str, str]]:
-    """System + user chat messages for one unit, from prompts/qa_generation.md.
+def build_messages(doc: "CanonicalDoc", unit: GenerationUnit, question_type: str,
+                   prompt_path: Path = PROMPT_PATH) -> list[dict[str, str]]:
+    """System + user chat messages for one unit, from the prompt file (cfg.prompts.qa_generation).
 
     The system message holds every rule, so it is the same for every call; the user message holds
     the document title, the unit's spans (labelled A and B in a two-span unit, each with its own
@@ -312,7 +314,7 @@ def build_messages(doc: "CanonicalDoc", unit: GenerationUnit, question_type: str
     """
     if question_type not in QUESTION_TYPES:
         raise ValueError(f"unknown question type {question_type!r}; known: {QUESTION_TYPES}")
-    prompt = load_prompt()
+    prompt = load_prompt(prompt_path)
     user = Template(prompt["user"]).substitute(
         doc_title=doc.title, passages=render_passages(doc, unit.spans, prompt["passage"]), question_type=question_type,
         two_span=Template(prompt["two_span"]).substitute() if unit.kind == "two_span" else "")
@@ -549,10 +551,12 @@ def generate_for_doc(doc: "CanonicalDoc", llm: ChatLLM, cfg: Config, rng: np.ran
         unit, qtype, skipped = retries[i]
         finish(_outcome(doc, unit, [qtype, FALLBACK_TYPE], [skipped, result], cfg))
 
+    prompt = cfg.prompts.qa_generation
     if todo:
-        llm.chat_many([build_messages(doc, u, t) for u, t in todo], json_schema=QA_JSON_SCHEMA, on_result=first)
+        llm.chat_many([build_messages(doc, u, t, prompt) for u, t in todo], json_schema=QA_JSON_SCHEMA,
+                      on_result=first)
     if retries:
-        llm.chat_many([build_messages(doc, u, FALLBACK_TYPE) for u, _, _ in retries],
+        llm.chat_many([build_messages(doc, u, FALLBACK_TYPE, prompt) for u, _, _ in retries],
                       json_schema=QA_JSON_SCHEMA, on_result=second)
     return outcomes
 
@@ -577,7 +581,7 @@ def load_pairs(path: Path) -> list[QAPair]:
 
 def provenance(cfg: Config, digest: str | None) -> dict[str, Any]:
     """Everything that decides what a unit gives: compared on every re-run, so a resumed run never
-    mixes two generators, prompts or unit rules in one file. `digest`: the generator's Ollama
+    mixes two generators, prompts or unit rules in one corpus. `digest`: the generator's Ollama
     digest (None for OpenAI, where the dated model name is the pin).
 
     Not included: qa.docs_per_corpus and --limit (they choose WHICH documents, not what a document
@@ -586,7 +590,7 @@ def provenance(cfg: Config, digest: str | None) -> dict[str, Any]:
     return {
         "version": GENERATION_VERSION,
         "generator": {**cfg.llm.qa_generator.model_dump(), "digest": digest},
-        "prompt_sha256": hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest(),
+        "prompt_sha256": hashlib.sha256(cfg.prompts.qa_generation.read_bytes()).hexdigest(),
         "seed": cfg.seed,
         "size_tokenizer": f"{cfg.chunking.size_tokenizer}@{cfg.chunking.size_tokenizer_revision}",
         "skip_section_titles": cfg.parsing.skip_section_titles,
@@ -614,37 +618,75 @@ def text_sha256(doc: "CanonicalDoc") -> str:
     return hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
 
 
-def check_provenance(paths: dict[str, Path], settings: dict[str, Any], docs: list["CanonicalDoc"],
-                     recreate: bool) -> dict[str, str]:
-    """Decide whether existing records can be resumed; return the stored doc hashes to extend.
+def read_provenance(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """raw.provenance.json as (settings by corpus, text hash by "<corpus>/<doc_id>"); both empty
+    without the file. A file written before 2026-10-28 holds one `settings` for all its corpora."""
+    if not path.exists():
+        return {}, {}
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    hashes: dict[str, str] = stored["docs"]
+    if "settings_by_corpus" in stored:
+        return stored["settings_by_corpus"], hashes
+    return {corpus: stored["settings"] for corpus in sorted({key.split("/")[0] for key in hashes})}, hashes
 
-    Records are resumed when they were made with the same `settings` and every document already
-    in them still has the same text (offsets of the evidence spans point into it). Otherwise
-    RuntimeError, until `recreate`, which deletes the records of EVERY corpus: the settings are
-    shared, so no part of the files is still valid then.
+
+def write_provenance(path: Path, settings: dict[str, dict[str, Any]], hashes: dict[str, str]) -> None:
+    write_json(path, {"settings_by_corpus": settings, "docs": hashes})
+
+
+def delete_records(paths: dict[str, Path], corpora: list[str]) -> None:
+    """`--recreate`: every record of `corpora` out of raw.jsonl and gen_dropped.jsonl, then their
+    settings and doc hashes out of the provenance; a file left empty is deleted. The other corpora's
+    lines stay as they are."""
+    settings, hashes = read_provenance(paths["provenance"])
+    for name in ("raw", "dropped"):
+        path = paths[name]
+        if not path.exists():
+            continue
+        records = list(read_jsonl(path))
+        kept = [r for r in records if r["corpus"] not in corpora]
+        if kept:
+            write_jsonl(path, kept)
+        else:
+            path.unlink()
+        log.info("deleted %d record(s) of %s from %s (--recreate)", len(records) - len(kept), ", ".join(corpora), path)
+    # Written last: after a crash the provenance still names the deleted corpora, which is harmless.
+    settings = {c: s for c, s in settings.items() if c not in corpora}
+    hashes = {key: sha for key, sha in hashes.items() if key.split("/")[0] not in corpora}
+    if settings or hashes:
+        write_provenance(paths["provenance"], settings, hashes)
+    else:
+        paths["provenance"].unlink(missing_ok=True)
+
+
+def check_provenance(paths: dict[str, Path], settings: dict[str, Any], corpora: list[str],
+                     docs: list["CanonicalDoc"], recreate: bool) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Decide whether the records of `corpora` can be resumed; return the stored settings by corpus
+    and doc hashes, to extend.
+
+    A corpus's records are resumed when they were made with the same `settings` and every document
+    already in them still has the same text (offsets of the evidence spans point into it).
+    Otherwise RuntimeError, until `recreate`, which deletes the records of `corpora` only
+    (`delete_records`). Corpora outside `corpora` aren't checked: this run doesn't touch them.
     """
     def fail(reason: str) -> RuntimeError:
-        return RuntimeError(f"{paths['raw'].parent}: {reason}; start over with `chunkeval gen-qa --recreate`")
+        scope = "".join(f" --corpus {c}" for c in corpora)
+        return RuntimeError(f"{paths['raw'].parent}: {reason}; start over with `chunkeval gen-qa{scope} --recreate`")
 
     if recreate:
-        for path in paths.values():
-            if path.exists():
-                path.unlink()
-                log.info("deleted %s (--recreate)", path)
-        return {}
-    if not paths["provenance"].exists():
-        if paths["raw"].exists() or paths["dropped"].exists():
-            raise fail(f"Q-A records without {paths['provenance'].name} (not made by this stage)")
-        return {}
-    stored = json.loads(paths["provenance"].read_text(encoding="utf-8"))
-    if stored["settings"] != settings:
-        differs = [key for key in settings if stored["settings"].get(key) != settings[key]]
-        raise fail(f"records made with other settings ({', '.join(differs)} differ)")
-    hashes: dict[str, str] = stored["docs"]
+        delete_records(paths, corpora)
+    if not paths["provenance"].exists() and (paths["raw"].exists() or paths["dropped"].exists()):
+        raise fail(f"Q-A records without {paths['provenance'].name} (not made by this stage)")
+    stored, hashes = read_provenance(paths["provenance"])
+    differs = {c: [key for key in settings if stored[c].get(key) != settings[key]]
+               for c in corpora if c in stored and stored[c] != settings}
+    if differs:
+        raise fail("records made with other settings ("
+                   + "; ".join(f"{c}: {', '.join(keys)} differ" for c, keys in differs.items()) + ")")
     changed = [f"{d.corpus}/{d.doc_id}" for d in docs if hashes.get(f"{d.corpus}/{d.doc_id}", text_sha256(d)) != text_sha256(d)]
     if changed:
         raise fail(f"documents re-parsed since their Q-A pairs were made: {', '.join(changed)}")
-    return hashes
+    return stored, hashes
 
 
 def summarize(paths: dict[str, Path]) -> dict[str, dict[str, Any]]:
@@ -692,8 +734,8 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
     per line, not api_error) and data/qa/raw.provenance.json, appending one line per unit as soon
     as it is final, so a crash or Ctrl+C loses only the units in flight. A re-run resumes: a unit
     already in either file is not asked again, as long as `check_provenance` passes; `recreate`
-    starts over. Units without an answer (API errors) are not saved: the stage fails at the end,
-    and a re-run asks them again.
+    starts `corpora` over, and leaves the other corpora's records alone. Units without an answer
+    (API errors) are not saved: the stage fails at the end, and a re-run asks them again.
 
     Generates more than the final set needs (filtering drops 40–60%); filter-qa samples down.
     The CLI already ran `check_ollama` before this and unloads the generator afterwards.
@@ -704,7 +746,7 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
     llm = ChatLLM("qa_generator", cfg, secrets)
     digest = ollama_model_digest(llm.base_url, llm.model) if llm.provider == "ollama" else None
     settings = provenance(cfg, digest)
-    hashes = check_provenance(paths, settings, [d for ds in docs.values() for d in ds], recreate)
+    stored, hashes = check_provenance(paths, settings, corpora, [d for ds in docs.values() for d in ds], recreate)
     done = done_ids(paths["raw"]) | done_ids(paths["dropped"])
 
     api_errors = 0
@@ -719,11 +761,12 @@ def run(cfg: Config, secrets: Secrets, corpora: list[str], limit: int | None = N
             append_jsonl(paths["dropped"], outcome)
 
     for corpus, corpus_docs in docs.items():
+        stored[corpus] = settings
         for i, doc in enumerate(corpus_docs, start=1):
             # Recorded before the first record of the doc, so a crash mid-doc can't leave records
-            # whose doc text is unknown to the next run's check.
+            # whose doc text or settings are unknown to the next run's check.
             hashes[f"{corpus}/{doc.doc_id}"] = text_sha256(doc)
-            write_json(paths["provenance"], {"settings": settings, "docs": hashes})
+            write_provenance(paths["provenance"], stored, hashes)
             rng = np.random.default_rng([cfg.seed, zlib.crc32(doc.doc_id.encode())])
             outcomes = generate_for_doc(doc, llm, cfg, rng, done, on_outcome=save)
             pairs = sum(isinstance(o, QAPair) for o in outcomes)

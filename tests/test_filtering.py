@@ -2,6 +2,7 @@
 de-duplication, and the `filter-qa` stage against a fake critic and a fake embedder (no LLM, no GPU)."""
 import csv
 import json
+from dataclasses import replace
 
 import jsonschema
 import numpy as np
@@ -266,28 +267,33 @@ def fake_embed(questions, cfg, secrets):
     return vectors
 
 
-@pytest.fixture
-def stage(cfg, tiny_doc, tmp_path, monkeypatch):
-    """raw.jsonl with 5 pairs on tiny_doc in a temporary data dir: one good, one failing the checks,
-    one the critic rejects, a near-duplicate of the good one (later in the document), and a good
-    two-span pair. Returns (cfg, critic, pairs by name)."""
-    cfg.paths.data_dir = tmp_path / "data"
-    write_json(cfg.paths.data_dir / "parsed" / "papers" / "tiny.json", tiny_doc)
-    pairs = {
-        "good": make_pair(tiny_doc, GOOD_Q, GOOD_A, GOOD_EV, ["Trials ran"]),
-        "checks": make_pair(tiny_doc, "In how many African countries is rice grown according to this study?",
+def stage_pairs(doc):
+    """5 pairs on tiny_doc (or a copy in another corpus): one good, one failing the checks, one the
+    critic rejects, a near-duplicate of the good one (later in the document), and a good two-span pair."""
+    return {
+        "good": make_pair(doc, GOOD_Q, GOOD_A, GOOD_EV, ["Trials ran"]),
+        "checks": make_pair(doc, "In how many African countries is rice grown according to this study?",
                             "Rice is grown in ca. 40 countries in Africa.", ["Rice is grown in ca. 40 countries in Africa"],
                             ["Rice is grown"]),
-        "critic": make_pair(tiny_doc, "What matters most for generic rice farming?", "Water management matters most.",
+        "critic": make_pair(doc, "What matters most for generic rice farming?", "Water management matters most.",
                             ["Water management matters most."], ["Water management"]),
-        "duplicate": make_pair(tiny_doc, "How many replicates per treatment did the Sahel sites have?",
+        "duplicate": make_pair(doc, "How many replicates per treatment did the Sahel sites have?",
                                "Every site had four replicates.", ["Yields rose at every site."], ["Yields rose"]),
-        "two_span": make_pair(tiny_doc, "How did irrigated and rainfed rice yields differ at the Sahel trial sites?",
+        "two_span": make_pair(doc, "How did irrigated and rainfed rice yields differ at the Sahel trial sites?",
                               "Irrigated vs. rainfed systems differ by approx. 2 t/ha.",
                               ["Irrigated vs. rainfed systems differ by approx. 2 t/ha",
                                "Trials ran at three sites in the Sahel"],
                               ["Yields depend", "Trials ran"], kind="two_span"),
     }
+
+
+@pytest.fixture
+def stage(cfg, tiny_doc, tmp_path, monkeypatch):
+    """raw.jsonl with the 5 `stage_pairs` on tiny_doc in a temporary data dir. Returns (cfg, critic,
+    pairs by name)."""
+    cfg.paths.data_dir = tmp_path / "data"
+    write_json(cfg.paths.data_dir / "parsed" / "papers" / "tiny.json", tiny_doc)
+    pairs = stage_pairs(tiny_doc)
     paths = qa_paths(cfg)
     write_jsonl(paths["raw"], pairs.values())
     write_json(paths["provenance"], {"settings": {}, "docs": {"papers/tiny": text_sha256(tiny_doc)}})
@@ -310,7 +316,7 @@ def test_run(stage):
     """Each pair ends where its flaw puts it, with its stage and reasons; the critic is asked twice
     per pair that passed the checks; the outputs are QAPairs in document order."""
     cfg, critic, pairs = stage
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     kept, rejected = outputs(cfg)
     assert [r["id"] for r in kept] == [pairs["two_span"].id, pairs["good"].id]
     assert all(QAPair(**{**r, "evidence": []}).id == r["id"] for r in kept)
@@ -336,7 +342,7 @@ def test_run(stage):
 def test_run_labelling_sample(stage):
     """Kept and judged-rejected pairs (not duplicates), without the filter's decision; never overwritten."""
     cfg, _, pairs = stage
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     path = run_dir(cfg) / "filter_qa_labelling.csv"
     with open(path, encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
@@ -345,7 +351,7 @@ def test_run_labelling_sample(stage):
     two_span = next(r for r in rows if r["id"] == pairs["two_span"].id)
     assert "--- B ---" in two_span["passage"] and "Trials ran" in two_span["passage"]
     path.write_text("labelled by hand\n", encoding="utf-8")
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert path.read_text(encoding="utf-8") == "labelled by hand\n"
 
 
@@ -353,26 +359,26 @@ def test_run_resumes_from_the_cache(stage):
     """A re-run asks nothing; a new threshold asks nothing; a changed answer asks that pair's
     passage call only; another critic setting asks everything again."""
     cfg, critic, pairs = stage
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     first = outputs(cfg)
     critic.calls.clear()
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert critic.calls == [] and outputs(cfg) == first
 
     cfg.qa.critic_min_score = 2
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert critic.calls == [] and pairs["critic"].id in [r["id"] for r in outputs(cfg)[0]]
 
     raw = qa_paths(cfg)["raw"]
     records = list(read_jsonl(raw))
     records[0]["answer"] = "Four replicates per treatment at each site."
     write_jsonl(raw, records)
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert [call for call, _ in critic.calls] == ["passage"]
 
     critic.calls.clear()
     cfg.llm.qa_critic.temperature = 0.3
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert len(critic.calls) == 8
 
 
@@ -383,12 +389,12 @@ def test_run_api_error_writes_nothing(stage):
     critic.respond = lambda call, user, schema: (ConnectionError("down") if "generic" in user
                                                  else strict_on_generic(call, user, schema))
     with pytest.raises(RuntimeError, match="re-run `chunkeval filter-qa`"):
-        run(cfg, None)
+        run(cfg, None, corpora=["papers"])
     assert not filter_paths(cfg)["filtered"].exists() and not filter_paths(cfg)["rejected"].exists()
     assert len(list(read_jsonl(filter_paths(cfg)["critic"]))) == 6
     critic.calls.clear()
     critic.respond = strict_on_generic
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert len(critic.calls) == 2 and all("generic" in text for _, text in critic.calls)
 
 
@@ -396,11 +402,11 @@ def test_run_unusable_answer_is_rejected_and_cached(stage):
     cfg, critic, pairs = stage
     critic.respond = lambda call, user, schema: (LLMOutputError("[qa_critic] answer cut off") if "generic" in user
                                                  and call == "question" else strict_on_generic(call, user, schema))
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     reasons = outputs(cfg)[1][pairs["critic"].id]["reasons"]
     assert reasons == ["critic_bad_output: question call: [qa_critic] answer cut off"]
     critic.calls.clear()
-    run(cfg, None)
+    run(cfg, None, corpora=["papers"])
     assert critic.calls == []
 
 
@@ -410,11 +416,80 @@ def test_run_refuses_reparsed_doc(stage, tiny_doc):
     tiny_doc.text = tiny_doc.text.replace("Rice is grown", "Rice is farmed")
     write_json(cfg.paths.data_dir / "parsed" / "papers" / "tiny.json", tiny_doc)
     with pytest.raises(RuntimeError, match="papers/tiny was re-parsed"):
-        run(cfg, None)
+        run(cfg, None, corpora=["papers"])
     assert critic.calls == []
+
+
+@pytest.fixture
+def two_corpora(stage, tiny_doc):
+    """`stage` with tiny_doc again as reports/tinyr, with the same 5 pairs. Returns (cfg, critic,
+    papers pairs, reports pairs)."""
+    cfg, critic, pairs = stage
+    doc = replace(tiny_doc, doc_id="tinyr", corpus="reports")
+    write_json(cfg.paths.data_dir / "parsed" / "reports" / "tinyr.json", doc)
+    reports = stage_pairs(doc)
+    paths = qa_paths(cfg)
+    write_jsonl(paths["raw"], [*pairs.values(), *reports.values()])
+    write_json(paths["provenance"], {"settings": {}, "docs": {"papers/tiny": text_sha256(tiny_doc),
+                                                               "reports/tinyr": text_sha256(doc)}})
+    return cfg, critic, pairs, reports
+
+
+def lines_of(path, corpus):
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if f'"corpus": "{corpus}"' in line]
+
+
+def test_run_per_corpus_carries_the_others_over(two_corpora, caplog):
+    """--corpus filters only those corpora: the others' lines stay exactly as the last run wrote
+    them, each corpus's filter settings are recorded, and a carried corpus whose pairs in raw.jsonl
+    changed since is flagged."""
+    cfg, critic, pairs, reports = two_corpora
+    paths = filter_paths(cfg)
+    run(cfg, None, corpora=["papers", "reports"])
+    before = {name: lines_of(paths[name], "reports") for name in ("filtered", "rejected")}
+    cfg.qa.critic_min_score = 2
+    critic.calls.clear()
+    run(cfg, None, corpora=["papers"])
+    kept = [r["id"] for r in read_jsonl(paths["filtered"])]
+    assert pairs["critic"].id in kept and reports["critic"].id not in kept and critic.calls == []
+    assert {name: lines_of(paths[name], "reports") for name in ("filtered", "rejected")} == before
+    settings = json.loads(paths["provenance"].read_text(encoding="utf-8"))["settings_by_corpus"]
+    assert (settings["papers"]["critic_min_score"], settings["reports"]["critic_min_score"]) == (2, 4)
+    assert settings["papers"]["critic"]["digest"] == "sha256:fake"
+
+    write_jsonl(qa_paths(cfg)["raw"], [*pairs.values(), *list(reports.values())[1:]])    # gen-qa ran again
+    with caplog.at_level("WARNING"):
+        run(cfg, None, corpora=["papers"])
+    assert "lacks 1 filtered one(s): run `chunkeval filter-qa --corpus reports`" in caplog.text
+
+
+def test_run_encodes_each_question_once(stage, monkeypatch):
+    """The de-duplication's vectors are cached by question: a re-run encodes nothing, a changed
+    question only itself."""
+    cfg, _, pairs = stage
+    encoded = []
+
+    def recording(questions, cfg, secrets):
+        encoded.extend(questions)
+        return fake_embed(questions, cfg, secrets)
+
+    monkeypatch.setattr(filtering, "embed_questions", recording)
+    run(cfg, None, corpora=["papers"])
+    assert sorted(encoded) == sorted(pairs[name].question for name in ("good", "duplicate", "two_span"))
+    assert filtering.dedup_cache_path(cfg, "papers").is_relative_to(cfg.paths.data_dir)
+    encoded.clear()
+    run(cfg, None, corpora=["papers"])
+    assert encoded == []
+
+    raw = qa_paths(cfg)["raw"]
+    records = list(read_jsonl(raw))
+    records[0]["question"] = "How many replicates of every treatment did each trial site in the Sahel have?"
+    write_jsonl(raw, records)
+    run(cfg, None, corpora=["papers"])
+    assert encoded == [records[0]["question"]]
 
 
 def test_run_needs_raw_pairs(cfg, tmp_path):
     cfg.paths.data_dir = tmp_path / "data"
     with pytest.raises(FileNotFoundError, match="run `chunkeval gen-qa` first"):
-        run(cfg, None)
+        run(cfg, None, corpora=["papers"])

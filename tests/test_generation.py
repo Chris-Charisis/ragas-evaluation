@@ -4,7 +4,7 @@ The quote locator has its own file, test_quote_locator.py.
 """
 import json
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import get_args
 
 import jsonschema
@@ -19,7 +19,8 @@ from chunkeval.corpus.parsing import is_skippable_section, load_doc
 from chunkeval.qa import generation
 from chunkeval.qa.generation import (PROMPT_PATH, QA_JSON_SCHEMA, QUESTION_TYPES, DroppedUnit, EvidenceSpan,
                                      GenerationUnit, QAPair, assign_types, build_messages,
-                                     generate_for_doc, load_pairs, load_prompt, qa_paths, run, sample_units)
+                                     generate_for_doc, load_pairs, load_prompt, qa_paths, read_provenance, run,
+                                     sample_units)
 
 
 def block_span(doc, startswith):
@@ -288,11 +289,13 @@ class FakeLLM:
     def __init__(self, respond=quote_each_passage):
         self.respond = respond
         self.calls: list[str] = []         # the user messages, in order
+        self.system_prompts: list[str] = []
 
     def chat_many(self, batch, json_schema=None, concurrency=None, on_result=None):
         results = []
         for i, messages in enumerate(batch):
             self.calls.append(messages[-1]["content"])
+            self.system_prompts.append(messages[0]["content"])
             out = self.respond(messages[-1]["content"])
             if not isinstance(out, Exception):
                 jsonschema.validate(out, json_schema)
@@ -440,7 +443,8 @@ def test_run_writes_and_resumes(stage):
     assert pairs and not dropped and len(llm.calls) == len(pairs)
     assert QAPair(**{**pairs[0], "evidence": []}).id == pairs[0]["id"]          # the records are QAPairs
     prov = json.loads(paths["provenance"].read_text(encoding="utf-8"))
-    assert prov["settings"]["generator"]["digest"] == "sha256:fake" and set(prov["docs"]) == {"papers/tiny"}
+    assert prov["settings_by_corpus"]["papers"]["generator"]["digest"] == "sha256:fake"
+    assert set(prov["docs"]) == {"papers/tiny"}
     summary = json.loads((run_dir(cfg) / "gen_qa_summary.json").read_text(encoding="utf-8"))
     assert summary["papers"]["pairs"] == len(pairs) and summary["papers"]["pair_rate"] == 1.0
     # tiny_doc's only two-span unit crosses from the Introduction into 2.1 Sites.
@@ -492,21 +496,32 @@ def test_run_refuses_other_settings(stage, change, differs):
     run(cfg, None, corpora=["papers"])
     change(cfg)
     llm.calls.clear()
-    with pytest.raises(RuntimeError, match=rf"other settings \({differs} differ\).*--recreate"):
+    with pytest.raises(RuntimeError, match=rf"other settings \(papers: {differs} differ\).*--corpus papers --recreate"):
         run(cfg, None, corpora=["papers"])
     assert llm.calls == []
     run(cfg, None, corpora=["papers"], recreate=True)
     assert llm.calls and len(records(paths["raw"])) == len(llm.calls)
 
 
-def test_run_refuses_other_prompt(stage, tmp_path, monkeypatch):
-    cfg, _, paths = stage
+def test_run_refuses_other_prompt(stage, tmp_path):
+    """prompts.qa_generation is the prompt sent and recorded: another text is refused, a copy of the
+    same text elsewhere is the same prompt."""
+    cfg, llm, paths = stage
     run(cfg, None, corpora=["papers"])
+    copy = tmp_path / "copy.md"
+    copy.write_text(PROMPT_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    cfg.prompts.qa_generation = copy
+    llm.calls.clear()
+    run(cfg, None, corpora=["papers"])
+    assert llm.calls == []
     prompt = tmp_path / "prompt.md"
-    prompt.write_text(PROMPT_PATH.read_text(encoding="utf-8") + "\nOne more rule.\n", encoding="utf-8")
-    monkeypatch.setattr(generation, "PROMPT_PATH", prompt)
+    prompt.write_text(PROMPT_PATH.read_text(encoding="utf-8").replace("\n## user", "\nOne more rule.\n\n## user"),
+                      encoding="utf-8")
+    cfg.prompts.qa_generation = prompt
     with pytest.raises(RuntimeError, match="prompt_sha256 differ"):
         run(cfg, None, corpora=["papers"])
+    run(cfg, None, corpora=["papers"], recreate=True)
+    assert llm.system_prompts[-1].endswith("One more rule.")
 
 
 def test_run_refuses_reparsed_doc(stage, tiny_doc):
@@ -525,6 +540,60 @@ def test_run_refuses_records_without_provenance(stage):
     paths["raw"].write_text('{"id": "tiny:s0"}\n', encoding="utf-8")
     with pytest.raises(RuntimeError, match="without raw.provenance.json"):
         run(cfg, None, corpora=["papers"])
+
+
+@pytest.fixture
+def two_corpora(stage, tiny_doc):
+    """`stage` with a second corpus: tiny_doc again as reports/tinyr."""
+    cfg, llm, paths = stage
+    write_json(cfg.paths.data_dir / "parsed" / "reports" / "tinyr.json", replace(tiny_doc, doc_id="tinyr", corpus="reports"))
+    return cfg, llm, paths
+
+
+def lines_of(path, corpus):
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if f'"corpus": "{corpus}"' in line]
+
+
+def test_run_settings_are_per_corpus(two_corpora):
+    """A corpus can be generated with other settings than the others; each corpus is checked
+    against its own, and the other corpora's records are left alone."""
+    cfg, llm, paths = two_corpora
+    run(cfg, None, corpora=["papers"])
+    papers = lines_of(paths["raw"], "papers")
+    cfg.llm.qa_generator.temperature = 0.2
+    run(cfg, None, corpora=["reports"])
+    assert lines_of(paths["raw"], "papers") == papers and lines_of(paths["raw"], "reports")
+    stored, _ = read_provenance(paths["provenance"])
+    assert (stored["papers"]["generator"]["temperature"], stored["reports"]["generator"]["temperature"]) == (0.7, 0.2)
+    with pytest.raises(RuntimeError, match=r"other settings \(papers: generator differ\)"):
+        run(cfg, None, corpora=["papers", "reports"])
+
+
+def test_recreate_deletes_only_the_selected_corpora(two_corpora):
+    cfg, llm, paths = two_corpora
+    run(cfg, None, corpora=["papers", "reports"])
+    papers = lines_of(paths["raw"], "papers")
+    cfg.seed = 7
+    llm.calls.clear()
+    run(cfg, None, corpora=["reports"], recreate=True)
+    assert lines_of(paths["raw"], "papers") == papers
+    assert llm.calls and len(lines_of(paths["raw"], "reports")) == len(llm.calls)
+    stored, hashes = read_provenance(paths["provenance"])
+    assert (stored["papers"]["seed"], stored["reports"]["seed"]) == (42, 7)
+    assert set(hashes) == {"papers/tiny", "reports/tinyr"}
+
+
+def test_old_provenance_format_is_read(stage):
+    """A raw.provenance.json from before 2026-10-28 (one `settings` for every corpus) resumes as is,
+    and the next write records the settings per corpus."""
+    cfg, llm, paths = stage
+    run(cfg, None, corpora=["papers"])
+    stored, hashes = read_provenance(paths["provenance"])
+    write_json(paths["provenance"], {"settings": stored["papers"], "docs": hashes})
+    llm.calls.clear()
+    run(cfg, None, corpora=["papers"])
+    assert llm.calls == []
+    assert set(json.loads(paths["provenance"].read_text(encoding="utf-8"))) == {"settings_by_corpus", "docs"}
 
 
 def test_question_types_match_config():
